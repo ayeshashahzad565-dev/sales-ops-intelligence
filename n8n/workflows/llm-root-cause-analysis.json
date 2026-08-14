@@ -1,0 +1,286 @@
+{
+  "id": "salesopsLlmRca01",
+  "name": "LLM Root Cause Analysis",
+  "active": false,
+  "nodes": [
+    {
+      "id": "schedule-daily",
+      "name": "Schedule - Daily",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -760,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 8,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "notes": "08:00, last in the chain. 05:00 FX -> 06:00 KPI -> 07:00 detect -> 07:30 decide -> 08:00 explain."
+    },
+    {
+      "id": "manual-run",
+      "name": "Manual Run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -760,
+        460
+      ],
+      "parameters": {},
+      "notes": "On-demand run for demos and targeted re-analysis. Same path as the schedule."
+    },
+    {
+      "id": "open-analysis-run",
+      "name": "Open Analysis Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -520,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Open the run ledger entry. Shared table, source='llm-root-cause'.\n--\n-- The same statement reports whether Stage 6 is in a state worth explaining,\n-- so the readiness check costs no extra round trip and is recorded against the\n-- run that acted on it.\n--\n-- \"Ready\" means Stage 6 decisions exist AND its most recent recorded run did\n-- not fail or hang. A decision pass still 'running' is explicitly NOT ready:\n-- explaining a half-written verdict would produce a fluent analysis of a\n-- severity that is about to change.\n--\n-- Note what is NOT part of readiness: how many anomalies are actionable. Zero\n-- is a healthy week, not a fault, and a gate that treated it as one would cry\n-- wolf on every quiet Monday.\nWITH last_decision AS (\n    SELECT status\n    FROM salesops.ingestion_runs\n    WHERE source = 'anomaly-decision'\n    ORDER BY started_at DESC\n    LIMIT 1\n),\nactionable AS (\n    SELECT min(calendar_date) AS from_date,\n           max(calendar_date) AS to_date,\n           count(*)           AS n\n    FROM salesops.anomaly_decisions\n    WHERE decision_version = $2 AND decision = 'action_required'\n)\nINSERT INTO salesops.ingestion_runs\n    (batch_id, source, window_from, window_to, status, n8n_execution_id)\nSELECT\n    gen_random_uuid(),\n    'llm-root-cause',\n    COALESCE((SELECT from_date FROM actionable), CURRENT_DATE),\n    COALESCE((SELECT to_date   FROM actionable), CURRENT_DATE),\n    'running',\n    $1\nRETURNING\n    batch_id::text    AS batch_id,\n    run_id,\n    window_from::text AS window_from,\n    window_to::text   AS window_to,\n    (SELECT n FROM actionable)::int                              AS actionable_anomalies,\n    (SELECT count(*) FROM salesops.anomaly_decisions\n      WHERE decision_version = $2)::int                          AS decision_rows,\n    COALESCE((SELECT status FROM last_decision), 'none')         AS decision_status,\n    (\n        (SELECT count(*) FROM salesops.anomaly_decisions WHERE decision_version = $2) > 0\n        AND COALESCE((SELECT status FROM last_decision), 'none') NOT IN ('running', 'failed')\n    )                                                            AS stage6_ready;",
+        "options": {
+          "queryReplacement": "={{ [ $execution.id, 'stage6-v1' ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Opens ingestion_runs with source='llm-root-cause' and reports Stage 6 readiness.",
+      "notesInFlow": false
+    },
+    {
+      "id": "stage6-ready",
+      "name": "Stage 6 Ready?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -280,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "stage6-ready-check",
+              "leftValue": "={{ $json.stage6_ready }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "Stage 7 explains Stage 6's verdicts, so it must not run against a decision pass that is still in flight or that failed."
+    },
+    {
+      "id": "analyze-anomalies",
+      "name": "Analyze Anomalies",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -40,
+        220
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://analytics-service:8000/anomalies/analyze",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ \"decision_version\": \"stage6-v1\", \"regenerate\": false }) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "onError": "continueErrorOutput",
+      "notes": "Service-name DNS, never localhost. NO API KEY HERE - the service reads LLM_API_KEY from its own environment, so no credential ever enters this workflow, its execution history, or the n8n database. regenerate stays false: a nightly job must never silently rewrite reasoning a human has already read. Retry is safe because analysis is idempotent - a second attempt re-analyses only what did not persist. Long timeout: this is one model call per actionable anomaly, not one call. On failure it routes to the second output rather than throwing, so this workflow always closes its own ledger entry.",
+      "notesInFlow": false
+    },
+    {
+      "id": "finalize-analysis-run",
+      "name": "Finalize Analysis Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        220,
+        220
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Close the run, deriving the status from what the service actually did.\n--\n-- 'failed'  every attempted analysis failed. The provider is down, the key is\n--           wrong, or the model is returning unusable output. Nothing about\n--           Stage 6 changed - the anomalies are still critical, still routed to\n--           a human, just unexplained.\n--\n-- 'partial' some analyses failed and some succeeded. Reported honestly rather\n--           than as success, because a caller reading only the status has to be\n--           able to trust it.\n--\n-- 'success' everything eligible was analysed, or nothing was eligible. An empty\n--           eligible set is a quiet week, not a fault.\n--\n-- records_received = anomalies processed, records_accepted = hypotheses written,\n-- records_rejected = analyses that failed, records_duplicate = already analysed.\n-- The four balance by construction, which satisfies the counts CHECK.\nUPDATE salesops.ingestion_runs r\nSET finished_at       = now(),\n    records_received  = ($2::int + $5::int),\n    records_accepted  = $3::int,\n    records_rejected  = $4::int,\n    records_duplicate = $5::int,\n    status            = CASE\n                            WHEN $4::int > 0 AND $3::int = 0 THEN 'failed'\n                            WHEN $4::int > 0                 THEN 'partial'\n                            ELSE 'success'\n                        END,\n    error_message     = CASE\n                            WHEN $4::int > 0\n                            THEN $4::text || ' of ' || $2::text\n                                 || ' analysis attempt(s) failed: ' || $6::text\n                        END\nWHERE r.batch_id = $1::uuid\nRETURNING\n    run_id,\n    batch_id::text   AS batch_id,\n    status,\n    records_received AS processed,\n    records_accepted AS hypotheses_written,\n    records_rejected AS analyses_failed,\n    records_duplicate AS already_analysed,\n    $7::text         AS model_provider,\n    $8::text         AS model_name,\n    $9::text         AS prompt_version,\n    (SELECT count(*) FROM salesops.anomaly_hypotheses)::int AS hypotheses_total,\n    (SELECT count(*) FROM salesops.anomaly_decisions\n      WHERE decision_version = 'stage6-v1' AND decision = 'action_required')::int\n                     AS actionable_anomalies,\n    round(extract(epoch FROM (finished_at - started_at))::numeric, 2) AS duration_seconds;",
+        "options": {
+          "queryReplacement": "={{ [ $('Open Analysis Run').first().json.batch_id, $('Analyze Anomalies').first().json.processed || 0, $('Analyze Anomalies').first().json.succeeded || 0, $('Analyze Anomalies').first().json.failed || 0, $('Analyze Anomalies').first().json.skipped_existing || 0, ($('Analyze Anomalies').first().json.failures || []).map(f => f.calendar_date + ' (' + f.reason + ')').join('; ').slice(0, 500) || 'none', $('Analyze Anomalies').first().json.model_provider || 'unknown', $('Analyze Anomalies').first().json.model_name || 'unknown', $('Analyze Anomalies').first().json.prompt_version || 'unknown' ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Status derived from the service's own counts, not from having reached this node. Model and prompt version are recorded on the run.",
+      "notesInFlow": false
+    },
+    {
+      "id": "fail-analysis-run",
+      "name": "Fail Analysis Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        220,
+        60
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The service could not be reached, or refused the request outright: no API\n-- key, no model, warehouse unreachable. Close the run as 'failed' with the\n-- reason.\n--\n-- This branch exists so the workflow always closes its own ledger entry. The\n-- error handler covers unexpected failures, but it is invoked by n8n and does\n-- not fire in every execution mode - and a run left at 'running' forever is\n-- indistinguishable from one still in flight. Owning the failure here makes the\n-- outcome the same however the workflow was started.\n--\n-- Nothing about Stage 6 changes. The anomalies are still critical, still routed\n-- to a human, still carrying their reason codes. They are simply unexplained.\nUPDATE salesops.ingestion_runs r\nSET finished_at   = now(),\n    status        = 'failed',\n    error_message = left(\n        'Stage 7 analysis could not run: ' || COALESCE($2::text, 'unknown error')\n        || '. No hypotheses were written; Stage 6 decisions are unchanged.',\n        1000)\nWHERE r.batch_id = $1::uuid\nRETURNING\n    run_id,\n    batch_id::text AS batch_id,\n    status,\n    error_message,\n    (SELECT count(*) FROM salesops.anomaly_decisions\n      WHERE decision_version = 'stage6-v1' AND decision = 'action_required')::int\n                   AS anomalies_left_unexplained;",
+        "options": {
+          "queryReplacement": "={{ [ $('Open Analysis Run').first().json.batch_id, ($json.error && ($json.error.message || $json.error.description)) || $json.message || 'the analytics service did not return a result' ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Closes the run as 'failed' when the service call itself fails. Stage 6 is untouched.",
+      "notesInFlow": false
+    },
+    {
+      "id": "abort-stage6-not-ready",
+      "name": "Abort - Stage 6 Not Ready",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -40,
+        400
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Stage 6 is not in an explainable state. Close the run as 'failed' with the\n-- reason, spend nothing with the provider, and explain nothing.\n--\n-- Recording the failure is the point. The alternative - analysing anyway -\n-- would produce confident explanations of verdicts that are about to change,\n-- and would bill for the privilege.\nUPDATE salesops.ingestion_runs r\nSET finished_at   = now(),\n    status        = 'failed',\n    error_message = format(\n        'Stage 6 not ready: %s decision row(s) for the requested version, last '\n        'anomaly-decision run status is %L. No anomalies were analysed and no '\n        'provider call was made.',\n        $2::text, $3::text)\nWHERE r.batch_id = $1::uuid\nRETURNING\n    run_id,\n    batch_id::text AS batch_id,\n    status,\n    error_message;",
+        "options": {
+          "queryReplacement": "={{ [ $('Open Analysis Run').first().json.batch_id, $('Open Analysis Run').first().json.decision_rows, $('Open Analysis Run').first().json.decision_status ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Closes the run as 'failed' without calling the provider.",
+      "notesInFlow": false
+    }
+  ],
+  "connections": {
+    "Schedule - Daily": {
+      "main": [
+        [
+          {
+            "node": "Open Analysis Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Run": {
+      "main": [
+        [
+          {
+            "node": "Open Analysis Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open Analysis Run": {
+      "main": [
+        [
+          {
+            "node": "Stage 6 Ready?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 6 Ready?": {
+      "main": [
+        [
+          {
+            "node": "Analyze Anomalies",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Abort - Stage 6 Not Ready",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze Anomalies": {
+      "main": [
+        [
+          {
+            "node": "Finalize Analysis Run",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fail Analysis Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "salesopsErrors001",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true
+  },
+  "tags": []
+}
