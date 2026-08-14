@@ -1,0 +1,175 @@
+name: CI
+
+# What this proves, and what it deliberately does not.
+#
+# Four jobs run on every push: the linter, the full schema suite against a real
+# PostgreSQL 17, every analytics test that needs no warehouse, and the mock
+# API's own suite.
+#
+# It does NOT run the integration tests that need a populated warehouse -
+# detection against 90 days of live KPIs, Stage 8 routing, Stage 9 execution.
+# Those need the whole stack plus an LLM key, and a CI badge that quietly
+# skipped a third of the suite would be worse than no badge. Run them locally:
+#
+#     ./bootstrap.sh && cd analytics-service && python -m pytest
+#
+# The schema job is the interesting one. The suite seeds the Stage 6 fixture it
+# needs when the database is empty, so a container that has existed for eleven
+# seconds proves exactly the same 277 guarantees as a warehouse with 90 days of
+# history in it - including the guard triggers behind authorisation,
+# exactly-once execution and reconciliation.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.16.0
+      - name: ruff check
+        run: ruff check --output-format=github .
+
+  schema:
+    name: Schema (277 checks, PostgreSQL 17)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          # Matches the local stack: the migrations name this database
+          # explicitly in their GRANT statements, so it cannot be renamed here.
+          POSTGRES_DB: salesops
+          POSTGRES_USER: salesops
+          POSTGRES_PASSWORD: ci-only-not-a-secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U salesops -d salesops"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: salesops
+      PGDATABASE: salesops
+      PGPASSWORD: ci-only-not-a-secret
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install psql
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+
+      - name: Apply migrations V001..V013
+        run: |
+          set -euo pipefail
+          for migration in database/migrations/V*.sql; do
+            echo "-> $(basename "$migration")"
+            psql -v ON_ERROR_STOP=1 --quiet -f "$migration"
+          done
+
+      - name: Registered migrations
+        run: psql -c "SELECT version, description FROM salesops.schema_migrations ORDER BY version;"
+
+      - name: Schema validation suite
+        run: psql -v ON_ERROR_STOP=1 -f database/tests/test_analytics_schema.sql
+
+      # The reporting role is the one privilege boundary that can be proven
+      # without the rest of the stack, so it is proven here rather than taken
+      # on trust from a migration that ran successfully.
+      - name: The reporting role can read, and cannot write
+        run: |
+          set -euo pipefail
+          psql -v ON_ERROR_STOP=1 -c "ALTER ROLE salesops_readonly WITH LOGIN PASSWORD 'ci-only';"
+          export PGPASSWORD=ci-only PGUSER=salesops_readonly
+
+          psql -v ON_ERROR_STOP=1 -qtAc "SELECT count(*) FROM salesops.kpi_daily;" >/dev/null
+          echo "  read: ok"
+
+          if psql -v ON_ERROR_STOP=1 -qtAc "DELETE FROM salesops.kpi_daily;" 2>/dev/null; then
+            echo "::error::salesops_readonly was able to DELETE from kpi_daily"; exit 1
+          fi
+          echo "  write: refused"
+
+          if psql -v ON_ERROR_STOP=1 -qtAc "SELECT salesops.purge_staging(TRUE,'ci');" 2>/dev/null; then
+            echo "::error::salesops_readonly was able to call purge_staging()"; exit 1
+          fi
+          echo "  execute on a volatile function: refused"
+
+  analytics:
+    name: Analytics service (160 offline tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: analytics-service/requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+        working-directory: analytics-service
+
+      # Named explicitly rather than run as a whole suite with skips. A suite
+      # that skips what it cannot reach reports green for the wrong reason, and
+      # this project has already been bitten by that once.
+      - name: Statistics, detection, prompts, validation and delivery content
+        working-directory: analytics-service
+        run: |
+          python -m pytest -q \
+            tests/test_statistics.py \
+            tests/test_baseline.py \
+            tests/test_detector.py \
+            tests/test_llm_config.py \
+            tests/test_llm_prompt.py \
+            tests/test_llm_validation.py \
+            tests/test_notification_content.py
+
+      - name: No test reached a network or a database
+        working-directory: analytics-service
+        run: |
+          # These suites are pure. If one of them ever grows a live dependency,
+          # it will start skipping in CI instead of failing, so the absence of
+          # skips is asserted rather than assumed.
+          python -m pytest -q -rs \
+            tests/test_statistics.py tests/test_baseline.py tests/test_detector.py \
+            tests/test_llm_config.py tests/test_llm_prompt.py \
+            tests/test_llm_validation.py tests/test_notification_content.py \
+            2>&1 | tee result.txt
+          if grep -qE "skipped|SKIPPED" result.txt; then
+            echo "::error::a supposedly offline test skipped - it has grown a live dependency"
+            exit 1
+          fi
+
+  mock-api:
+    name: Mock API (84 tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: mock-api/requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+        working-directory: mock-api
+      - run: python -m pytest -q
+        working-directory: mock-api
