@@ -1,0 +1,253 @@
+{
+  "id": "salesopsDecide01",
+  "name": "Deterministic Anomaly Decision",
+  "active": false,
+  "nodes": [
+    {
+      "id": "schedule-daily",
+      "name": "Schedule - Daily",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -760,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 7,
+              "triggerAtMinute": 30
+            }
+          ]
+        }
+      },
+      "notes": "07:30, half an hour after Statistical Anomaly Detection. 05:00 FX -> 06:00 KPI -> 07:00 detect -> 07:30 decide."
+    },
+    {
+      "id": "manual-run",
+      "name": "Manual Run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -760,
+        460
+      ],
+      "parameters": {},
+      "notes": "On-demand run for backfills, demos and CLI execution. Same path as the schedule."
+    },
+    {
+      "id": "open-decision-run",
+      "name": "Open Decision Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -520,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Open the run ledger entry. Shared table, source='anomaly-decision'.\n--\n-- The same statement also reports whether Stage 5 is in a state worth deciding\n-- on, so the readiness check costs no extra round trip and is recorded against\n-- the run that acted on it.\n--\n-- \"Ready\" means: Stage 5 evidence exists, AND its most recent recorded run did\n-- not fail or hang. A detector run still 'running' is explicitly NOT ready -\n-- deciding halfway through a detection pass would grade a partly-rewritten\n-- table. A detector that has never run through n8n at all ('none') is allowed,\n-- because the detector is also reachable over HTTP and by CLI, and refusing\n-- there would block every fresh environment on a bookkeeping technicality\n-- rather than on the evidence, which is what actually matters.\nWITH last_detect AS (\n    SELECT status\n    FROM salesops.ingestion_runs\n    WHERE source = 'anomaly-detector'\n    ORDER BY started_at DESC\n    LIMIT 1\n),\nspan AS (\n    SELECT min(calendar_date) AS from_date, max(calendar_date) AS to_date\n    FROM salesops.anomaly_daily\n)\nINSERT INTO salesops.ingestion_runs\n    (batch_id, source, window_from, window_to, status, n8n_execution_id)\nSELECT\n    gen_random_uuid(),\n    'anomaly-decision',\n    COALESCE((SELECT from_date FROM span), CURRENT_DATE),\n    COALESCE((SELECT to_date   FROM span), CURRENT_DATE),\n    'running',\n    $1\nRETURNING\n    batch_id::text    AS batch_id,\n    run_id,\n    window_from::text AS window_from,\n    window_to::text   AS window_to,\n    (SELECT count(*) FROM salesops.anomaly_daily)::int          AS anomaly_rows,\n    COALESCE((SELECT status FROM last_detect), 'none')          AS detector_status,\n    (\n        (SELECT count(*) FROM salesops.anomaly_daily) > 0\n        AND COALESCE((SELECT status FROM last_detect), 'none') NOT IN ('running', 'failed')\n    )                                                           AS stage5_ready;",
+        "options": {
+          "queryReplacement": "={{ [ $execution.id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Opens ingestion_runs with source='anomaly-decision' and reports Stage 5 readiness.",
+      "notesInFlow": false
+    },
+    {
+      "id": "stage5-ready",
+      "name": "Stage 5 Ready?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -280,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "stage5-ready-check",
+              "leftValue": "={{ $json.stage5_ready }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "Stage 6 decides on Stage 5's output, so it must not run against a detection pass that is still in flight or that failed."
+    },
+    {
+      "id": "decide-anomalies",
+      "name": "Decide Anomalies",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -40,
+        220
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The deterministic decision engine.\n--\n-- Every rule lives in salesops.decide_anomalies() rather than in this node, for\n-- the same reason refresh_kpi_daily() does: the decision upsert and the reason-\n-- code rebuild must be atomic. If they were two nodes, a failure between them\n-- would leave decisions carrying the previous run's reason codes - an audit\n-- trail that contradicts the verdict it explains, which is worse than none.\n--\n-- It also means the test suite exercises exactly the SQL production runs.\n--\n-- The thresholds behind these decisions are rows in salesops.decision_thresholds\n-- keyed by this version string, not constants hidden in a function body. Change\n-- a threshold and you must change the version: the guard trigger refuses to\n-- rewrite the numbers under decisions that were already made with them.\n--\n-- No LLM is involved, reachable, or required here. Stage 7 will read what this\n-- produces; it cannot alter it.\nSELECT * FROM salesops.decide_anomalies($1);",
+        "options": {
+          "queryReplacement": "={{ [ 'stage6-v1' ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Calls salesops.decide_anomalies('stage6-v1'). Idempotent full re-evaluation.",
+      "notesInFlow": false
+    },
+    {
+      "id": "finalize-decision-run",
+      "name": "Finalize Decision Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        220,
+        220
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Close the run, deriving the status from what is actually in the table.\n--\n-- 'failed'  the engine returned but wrote nothing while Stage 5 evidence exists.\n--           Reaching the last node is not success; producing no decision over a\n--           populated evidence table is a malfunction and is recorded as one.\n--\n-- 'partial' at least one flagged date carries business_impact_tier='unknown',\n--           meaning its Stage 5 baseline revenue was missing so impact could not\n--           be measured. Those dates were escalated rather than assumed harmless,\n--           but the run's output rests on incomplete evidence and says so.\n--           Dates with insufficient history do NOT make a run partial: a young\n--           warehouse having no baseline yet is expected, not degraded.\n--\n-- 'success' every decision rests on measured evidence.\n--\n-- records_received = anomalies evaluated, records_accepted = decisions written.\n-- Equal by construction (the engine writes a decision for every evidence row),\n-- which satisfies the counts-balance CHECK on ingestion_runs.\nWITH stats AS (\n    SELECT\n        count(*) FILTER (WHERE severity = 'minor')              AS minor_count,\n        count(*) FILTER (WHERE severity = 'major')              AS major_count,\n        count(*) FILTER (WHERE severity = 'critical')           AS critical_count,\n        count(*) FILTER (WHERE routing  = 'no_action')          AS no_action_count,\n        count(*) FILTER (WHERE routing  = 'auto_notify')        AS auto_notify_count,\n        count(*) FILTER (WHERE routing  = 'human_review')       AS human_review_count,\n        count(*) FILTER (WHERE business_impact_tier = 'unknown') AS unmeasured_count,\n        count(*) FILTER (WHERE baseline_status <> 'scored')      AS unscorable_count,\n        count(*)                                                AS decision_rows\n    FROM salesops.anomaly_decisions\n    WHERE decision_version = $4\n)\nUPDATE salesops.ingestion_runs r\nSET finished_at       = now(),\n    records_received  = $2::int,\n    records_accepted  = $3::int,\n    records_rejected  = 0,\n    records_duplicate = 0,\n    status            = CASE\n                            WHEN $3::int = 0 AND $2::int > 0 THEN 'failed'\n                            WHEN (SELECT unmeasured_count FROM stats) > 0 THEN 'partial'\n                            ELSE 'success'\n                        END,\n    error_message     = CASE\n                            WHEN $3::int = 0 AND $2::int > 0\n                            THEN 'Decision engine wrote no decisions over '\n                                 || $2::text || ' Stage 5 evidence row(s).'\n                        END\nWHERE r.batch_id = $1::uuid\nRETURNING\n    run_id,\n    batch_id::text AS batch_id,\n    status,\n    $4::text                                     AS decision_version,\n    records_received AS anomalies_evaluated,\n    records_accepted AS decisions_written,\n    (SELECT minor_count         FROM stats)::int AS minor,\n    (SELECT major_count         FROM stats)::int AS major,\n    (SELECT critical_count      FROM stats)::int AS critical,\n    (SELECT no_action_count     FROM stats)::int AS routing_no_action,\n    (SELECT auto_notify_count   FROM stats)::int AS routing_auto_notify,\n    (SELECT human_review_count  FROM stats)::int AS routing_human_review,\n    (SELECT unscorable_count    FROM stats)::int AS unscorable,\n    (SELECT unmeasured_count    FROM stats)::int AS impact_unmeasured,\n    (SELECT count(*) FROM salesops.anomaly_decision_reasons)::int AS reason_codes_total,\n    round(extract(epoch FROM (finished_at - started_at))::numeric, 2) AS duration_seconds;",
+        "options": {
+          "queryReplacement": "={{ [ $('Open Decision Run').first().json.batch_id, $('Decide Anomalies').first().json.anomalies_evaluated || 0, $('Decide Anomalies').first().json.decisions_written || 0, 'stage6-v1' ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Status derived from persisted decisions, not from having reached this node.",
+      "notesInFlow": false
+    },
+    {
+      "id": "abort-stage5-not-ready",
+      "name": "Abort - Stage 5 Not Ready",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -40,
+        400
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Stage 5 is not in a decidable state. Close the run as 'failed' with the\n-- reason, and decide nothing.\n--\n-- Recording a failure is the point. The alternative - deciding anyway - would\n-- publish severities derived from a half-written or failed detection pass, and\n-- publish them with exactly the same confidence as a good run. A visible failed\n-- row is recoverable; a plausible wrong decision is not.\nUPDATE salesops.ingestion_runs r\nSET finished_at   = now(),\n    status        = 'failed',\n    error_message = format(\n        'Stage 5 not ready: anomaly_daily has %s row(s), last anomaly-detector run status is %L. '\n        'No decisions were made.',\n        $2::text, $3::text)\nWHERE r.batch_id = $1::uuid\nRETURNING\n    run_id,\n    batch_id::text AS batch_id,\n    status,\n    error_message;",
+        "options": {
+          "queryReplacement": "={{ [ $('Open Decision Run').first().json.batch_id, $('Open Decision Run').first().json.anomaly_rows, $('Open Decision Run').first().json.detector_status ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Closes the run as 'failed' rather than deciding on untrustworthy evidence.",
+      "notesInFlow": false
+    }
+  ],
+  "connections": {
+    "Schedule - Daily": {
+      "main": [
+        [
+          {
+            "node": "Open Decision Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Run": {
+      "main": [
+        [
+          {
+            "node": "Open Decision Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open Decision Run": {
+      "main": [
+        [
+          {
+            "node": "Stage 5 Ready?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 5 Ready?": {
+      "main": [
+        [
+          {
+            "node": "Decide Anomalies",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Abort - Stage 5 Not Ready",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Anomalies": {
+      "main": [
+        [
+          {
+            "node": "Finalize Decision Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "salesopsErrors001",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true
+  },
+  "tags": []
+}
