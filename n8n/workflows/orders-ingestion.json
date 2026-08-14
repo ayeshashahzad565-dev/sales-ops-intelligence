@@ -1,0 +1,427 @@
+{
+  "id": "salesopsIngest001",
+  "name": "Orders Ingestion",
+  "active": false,
+  "nodes": [
+    {
+      "id": "schedule-hourly",
+      "name": "Schedule - Hourly",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -460,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "notes": "Development cadence. The window logic is what makes the schedule safe, not the interval."
+    },
+    {
+      "id": "manual-run",
+      "name": "Manual Run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        460
+      ],
+      "parameters": {},
+      "notes": "On-demand run for backfills, demos and CLI execution. Same path as the schedule."
+    },
+    {
+      "id": "create-batch-context",
+      "name": "Create Batch Context",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -240,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Open the run ledger entry BEFORE any data moves.\n-- A crash after this point leaves a visible 'running' row rather than silence.\n--\n-- Window strategy: re-request the last successful window's final day (orders\n-- arrive during the day, so yesterday's window was incomplete when it ran),\n-- or backfill 180 days on a cold start. Overlap is safe because fact_orders\n-- is keyed on order_id.\nWITH last_success AS (\n    SELECT max(window_to) AS last_to\n    FROM salesops.ingestion_runs\n    -- Scoped to this pipeline's own source. ingestion_runs is shared with the\n    -- FX sync and the KPI refresh (Stage 4); without this filter their windows\n    -- would be mistaken for ours and the next window would be computed wrong.\n    WHERE source = 'mock-sales-api'\n      AND status IN ('success', 'partial')\n)\nINSERT INTO salesops.ingestion_runs\n    (batch_id, source, window_from, window_to, status, n8n_execution_id)\nSELECT\n    gen_random_uuid(),\n    'mock-sales-api',\n    COALESCE(\n        (SELECT last_to FROM last_success) - INTERVAL '1 day',\n        CURRENT_DATE - INTERVAL '180 days'\n    )::date,\n    CURRENT_DATE,\n    'running',\n    $1\nRETURNING\n    batch_id::text    AS batch_id,\n    window_from::text AS window_from,\n    window_to::text   AS window_to,\n    run_id;",
+        "options": {
+          "queryReplacement": "={{ [ $execution.id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Opens the ingestion_runs row as 'running' and computes this run's date window.",
+      "notesInFlow": false
+    },
+    {
+      "id": "fetch-orders",
+      "name": "Fetch Orders",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -20,
+        300
+      ],
+      "parameters": {
+        "url": "http://mock-api:8000/orders",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "from",
+              "value": "={{ $json.window_from }}"
+            },
+            {
+              "name": "to",
+              "value": "={{ $json.window_to }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "notes": "Service-name DNS, never localhost. 3 attempts, 5s apart. Non-2xx throws by default."
+    },
+    {
+      "id": "validate-api-response",
+      "name": "Validate API Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Guard the boundary with the outside world.\n//\n// The HTTP node already fails on a non-2xx status and on a network error. What\n// it cannot judge is whether a 200 response is actually the payload we expect,\n// so that check lives here. Throwing stops the workflow: a malformed response\n// must never be treated as \"zero orders today\" and quietly close the run as a\n// success.\n\nconst batch = $('Create Batch Context').first().json;\nconst body = $input.first().json;\n\nif (body === null || typeof body !== 'object') {\n  throw new Error(`Mock API returned a ${typeof body} rather than a JSON object`);\n}\n\nif (!Array.isArray(body.orders)) {\n  throw new Error(\n    `Mock API response has no \"orders\" array (got ${typeof body.orders}). ` +\n    `Keys present: ${Object.keys(body).join(', ') || '<none>'}`\n  );\n}\n\nif (typeof body.count !== 'number') {\n  throw new Error('Mock API response has no numeric \"count\" field');\n}\n\n// A self-inconsistent response means truncation or a contract change upstream.\n// Either way, ingesting it would silently under-count revenue.\nif (body.count !== body.orders.length) {\n  throw new Error(\n    `Mock API response is inconsistent: count=${body.count} but ` +\n    `orders array holds ${body.orders.length} items`\n  );\n}\n\n// An empty window is legitimate - a re-run within the same hour, or a window\n// with no trading. It is not an error; it flows through as a run of zero.\nreturn [{\n  json: {\n    batch_id: batch.batch_id,\n    window_from: batch.window_from,\n    window_to: batch.window_to,\n    records_received: body.orders.length,\n    orders_json: JSON.stringify(body.orders),\n  },\n}];"
+      },
+      "notes": "Shape check only. Throws on a malformed 200 so it is never mistaken for an empty day."
+    },
+    {
+      "id": "stage-raw-orders",
+      "name": "Stage Raw Orders",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Land every payload exactly as received, in one set-based statement.\n-- The whole orders array arrives as a single JSONB parameter, so 4,000 orders\n-- cost one round trip instead of 4,000.\n--\n-- No validation here by design: staging must be unable to reject anything,\n-- or a malformed row has nowhere to land and the dead-letter trail is lost.\nWITH landed AS (\n    INSERT INTO salesops.raw_orders_staging (batch_id, order_id, source_payload)\n    SELECT\n        $1::uuid,\n        o ->> 'order_id',\n        o\n    FROM jsonb_array_elements($2::jsonb) AS o\n    RETURNING 1\n)\nSELECT count(*)::int AS records_staged FROM landed;",
+        "options": {
+          "queryReplacement": "={{ [ $json.batch_id, $json.orders_json ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "One set-based INSERT. Payloads land untouched - this is the traceability boundary.",
+      "notesInFlow": false
+    },
+    {
+      "id": "validate-orders",
+      "name": "Validate Orders",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Validate against the Stage 2 business rules and dead-letter the failures.\n--\n-- Every rule is evaluated for every row, so the error_message lists ALL the\n-- reasons a record was rejected rather than only the first. Fixing one problem\n-- and rediscovering the next on the next run wastes a cycle each time.\n--\n-- Casts go through salesops.try_to_* so that garbage input returns NULL rather\n-- than raising and aborting the batch this statement exists to isolate.\nWITH candidate AS (\n    SELECT s.ingestion_id, s.source_payload AS p\n    FROM salesops.raw_orders_staging s\n    WHERE s.batch_id = $1::uuid\n      AND s.processing_status = 'pending'\n),\ntyped AS (\n    SELECT\n        c.ingestion_id,\n        btrim(COALESCE(c.p ->> 'order_id', ''))    AS order_id,\n        salesops.try_to_date(c.p ->> 'order_date') AS order_date,\n        c.p ->> 'region'                           AS region_code,\n        c.p ->> 'product'                          AS product_sku,\n        c.p ->> 'channel'                          AS channel_code,\n        btrim(COALESCE(c.p ->> 'customer_id', '')) AS customer_id,\n        salesops.try_to_numeric(c.p ->> 'quantity')      AS quantity,\n        salesops.try_to_numeric(c.p ->> 'unit_price')    AS unit_price,\n        salesops.try_to_numeric(c.p ->> 'refund_amount') AS refund_amount,\n        upper(btrim(COALESCE(c.p ->> 'currency', '')))   AS currency\n    FROM candidate c\n),\nchecked AS (\n    SELECT\n        t.ingestion_id,\n        array_remove(ARRAY[\n            CASE WHEN t.order_id = ''\n                 THEN 'order_id is missing or empty' END,\n            CASE WHEN t.order_date IS NULL\n                 THEN 'order_date is missing or not a valid date' END,\n            CASE WHEN t.order_date IS NOT NULL AND NOT EXISTS (\n                     SELECT 1 FROM salesops.dim_date d WHERE d.calendar_date = t.order_date)\n                 THEN 'order_date ' || t.order_date::text || ' is outside dim_date' END,\n            CASE WHEN t.customer_id = ''\n                 THEN 'customer_id is missing or empty' END,\n            -- Unknown reference values are rejected, never auto-created. This is\n            -- what makes reference-data drift visible instead of silently\n            -- growing a dimension nobody agreed to.\n            CASE WHEN NOT EXISTS (\n                     SELECT 1 FROM salesops.dim_region r WHERE r.region_code = t.region_code)\n                 THEN 'unknown region: ' || COALESCE(t.region_code, '<null>') END,\n            CASE WHEN NOT EXISTS (\n                     SELECT 1 FROM salesops.dim_product p2 WHERE p2.product_sku = t.product_sku)\n                 THEN 'unknown product: ' || COALESCE(t.product_sku, '<null>') END,\n            CASE WHEN NOT EXISTS (\n                     SELECT 1 FROM salesops.dim_channel ch WHERE ch.channel_code = t.channel_code)\n                 THEN 'unknown channel: ' || COALESCE(t.channel_code, '<null>') END,\n            CASE WHEN t.quantity IS NULL THEN 'quantity is missing or not numeric'\n                 WHEN t.quantity <= 0   THEN 'quantity must be greater than zero' END,\n            CASE WHEN t.unit_price IS NULL THEN 'unit_price is missing or not numeric'\n                 WHEN t.unit_price < 0    THEN 'unit_price must not be negative' END,\n            CASE WHEN t.refund_amount IS NULL THEN 'refund_amount is missing or not numeric'\n                 WHEN t.refund_amount < 0    THEN 'refund_amount must not be negative' END,\n            CASE WHEN t.refund_amount IS NOT NULL\n                  AND t.quantity IS NOT NULL\n                  AND t.unit_price IS NOT NULL\n                  AND t.refund_amount > t.quantity * t.unit_price\n                 THEN 'refund_amount exceeds gross amount' END,\n            CASE WHEN t.currency !~ '^[A-Z]{3}$'\n                 THEN 'currency is not a 3-letter ISO code: ' || COALESCE(NULLIF(t.currency, ''), '<null>')\n                 WHEN t.currency NOT IN ('USD', 'EUR', 'GBP', 'JPY', 'BRL')\n                 THEN 'unsupported currency: ' || t.currency END\n        ]::text[], NULL) AS reasons\n    FROM typed t\n),\nrejected AS (\n    UPDATE salesops.raw_orders_staging s\n    SET processing_status = 'failed',\n        error_message     = array_to_string(c.reasons, '; '),\n        processed_at      = now()\n    FROM checked c\n    WHERE s.ingestion_id = c.ingestion_id\n      AND cardinality(c.reasons) > 0\n    RETURNING 1\n)\nSELECT\n    (SELECT count(*) FROM rejected)::int                              AS records_rejected,\n    (SELECT count(*) FROM checked WHERE cardinality(reasons) = 0)::int AS records_valid;",
+        "options": {
+          "queryReplacement": "={{ [ $('Validate API Response').first().json.batch_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Dead-letters invalid rows with every failing reason. Payload is left intact.",
+      "notesInFlow": false
+    },
+    {
+      "id": "resolve-customers",
+      "name": "Resolve Customers",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- dim_customer is a late-arriving dimension: customers exist because an order\n-- referenced them, not because a customer feed was loaded first.\n--\n-- LEAST() on conflict means first_seen_date only ever moves earlier, so a\n-- backfill of older orders corrects the value instead of corrupting it.\n--\n-- customer_name is deliberately not set. The orders API carries no name, and\n-- fabricating one would put invented data in the warehouse.\nWITH incoming AS (\n    SELECT DISTINCT ON (s.source_payload ->> 'customer_id')\n        s.source_payload ->> 'customer_id'                    AS customer_id,\n        r.region_id,\n        salesops.try_to_date(s.source_payload ->> 'order_date') AS first_seen_date\n    FROM salesops.raw_orders_staging s\n    JOIN salesops.dim_region r\n      ON r.region_code = s.source_payload ->> 'region'\n    WHERE s.batch_id = $1::uuid\n      AND s.processing_status = 'pending'\n    ORDER BY\n        s.source_payload ->> 'customer_id',\n        salesops.try_to_date(s.source_payload ->> 'order_date')\n),\nupserted AS (\n    INSERT INTO salesops.dim_customer (customer_id, region_id, first_seen_date)\n    SELECT customer_id, region_id, first_seen_date FROM incoming\n    ON CONFLICT (customer_id) DO UPDATE\n        SET first_seen_date = LEAST(\n                salesops.dim_customer.first_seen_date,\n                EXCLUDED.first_seen_date)\n    RETURNING 1\n)\nSELECT count(*)::int AS customers_upserted FROM upserted;",
+        "options": {
+          "queryReplacement": "={{ [ $('Validate API Response').first().json.batch_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Late-arriving dimension upsert. first_seen_date only ever moves earlier.",
+      "notesInFlow": false
+    },
+    {
+      "id": "insert-facts",
+      "name": "Insert Facts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Resolve source labels to surrogate keys by JOIN, then insert idempotently.\n--\n-- ON CONFLICT (order_id) DO NOTHING, not DO UPDATE: a placed order is an\n-- immutable historical event. Re-reading the same window must never rewrite\n-- what was already recorded, because a silent overwrite would destroy the\n-- audit trail the staging layer exists to provide. Corrections belong in a\n-- deliberate amendment process, not in a routine re-run.\n--\n-- Generated columns (gross_amount_local and the three USD amounts) are absent\n-- from the column list - PostgreSQL rejects any attempt to write them.\nWITH ready AS (\n    SELECT DISTINCT ON (s.source_payload ->> 'order_id')\n        s.ingestion_id,\n        s.source_payload ->> 'order_id'                          AS order_id,\n        salesops.try_to_date(s.source_payload ->> 'order_date')  AS order_date,\n        s.source_payload ->> 'customer_id'                       AS customer_id,\n        r.region_id,\n        p.product_id,\n        c.channel_id,\n        salesops.try_to_numeric(s.source_payload ->> 'quantity')::integer         AS quantity,\n        salesops.try_to_numeric(s.source_payload ->> 'unit_price')::numeric(14,4) AS unit_price,\n        upper(s.source_payload ->> 'currency')                                    AS currency,\n        salesops.try_to_numeric(s.source_payload ->> 'refund_amount')::numeric(18,4) AS refund_amount_local\n    FROM salesops.raw_orders_staging s\n    JOIN salesops.dim_region  r ON r.region_code  = s.source_payload ->> 'region'\n    JOIN salesops.dim_product p ON p.product_sku  = s.source_payload ->> 'product'\n    JOIN salesops.dim_channel c ON c.channel_code = s.source_payload ->> 'channel'\n    WHERE s.batch_id = $1::uuid\n      AND s.processing_status = 'pending'\n    ORDER BY s.source_payload ->> 'order_id', s.ingestion_id\n),\ninserted AS (\n    INSERT INTO salesops.fact_orders (\n        order_id, order_date, customer_id, region_id, product_id, channel_id,\n        quantity, unit_price, currency, refund_amount_local)\n    SELECT\n        order_id, order_date, customer_id, region_id, product_id, channel_id,\n        quantity, unit_price, currency, refund_amount_local\n    FROM ready\n    ON CONFLICT (order_id) DO NOTHING\n    RETURNING order_id\n),\n-- Close out every pending row of the batch, including any duplicate order_ids\n-- collapsed by DISTINCT ON above, so nothing is left stuck at 'pending'.\nmarked AS (\n    UPDATE salesops.raw_orders_staging tgt\n    SET processing_status = CASE WHEN i.order_id IS NOT NULL THEN 'processed' ELSE 'skipped' END,\n        processed_at      = now()\n    FROM salesops.raw_orders_staging src\n    LEFT JOIN inserted i ON i.order_id = src.source_payload ->> 'order_id'\n    WHERE tgt.ingestion_id = src.ingestion_id\n      AND src.batch_id = $1::uuid\n      AND src.processing_status = 'pending'\n    RETURNING tgt.processing_status AS final_status\n)\nSELECT\n    count(*) FILTER (WHERE final_status = 'processed')::int AS records_accepted,\n    count(*) FILTER (WHERE final_status = 'skipped')::int   AS records_duplicate\nFROM marked;",
+        "options": {
+          "queryReplacement": "={{ [ $('Validate API Response').first().json.batch_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "ON CONFLICT DO NOTHING. Orders are immutable events; a re-run must not rewrite history.",
+      "notesInFlow": false
+    },
+    {
+      "id": "ensure-usd-identity-rate",
+      "name": "Ensure USD Identity Rate",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1300,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- USD -> USD is an identity, not a market rate, so recording it here is not\n-- inventing FX. Without it every USD order would sit unconverted forever,\n-- because Frankfurter never returns a USD/USD pair.\n--\n-- source = 'identity' keeps it distinguishable from anything fetched.\nWITH added AS (\n    INSERT INTO salesops.exchange_rates (rate_date, currency, rate_to_usd, source)\n    SELECT d::date, 'USD', 1.0, 'identity'\n    FROM generate_series($1::date, $2::date, INTERVAL '1 day') AS d\n    ON CONFLICT (rate_date, currency) DO NOTHING\n    RETURNING 1\n)\nSELECT count(*)::int AS usd_rates_added FROM added;",
+        "options": {
+          "queryReplacement": "={{ [ $('Validate API Response').first().json.window_from, $('Validate API Response').first().json.window_to ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "USD->USD = 1.0 is an identity, not invented FX. Frankfurter never returns this pair.",
+      "notesInFlow": false
+    },
+    {
+      "id": "attach-available-fx",
+      "name": "Attach Available FX",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1520,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Attach whatever rates already exist. Stage 3 does not fetch FX - the\n-- Frankfurter sync is a separate workflow - so non-USD rows legitimately stay\n-- NULL here and their USD amounts stay NULL with them.\n--\n-- Setting exchange_rate_to_usd is all that is needed: gross/refund/net USD are\n-- generated columns and recompute themselves. Nothing writes a money value\n-- twice, so nothing can drift out of step with its rate.\n--\n-- Only fills rows that have no rate yet, so a corrected rate is never\n-- overwritten by a routine re-run.\nWITH applied AS (\n    UPDATE salesops.fact_orders f\n    SET exchange_rate_to_usd = x.rate_to_usd\n    FROM salesops.exchange_rates x\n    WHERE x.rate_date = f.order_date\n      AND x.currency  = f.currency\n      AND f.exchange_rate_to_usd IS NULL\n      AND f.order_date BETWEEN $1::date AND $2::date\n    RETURNING 1\n)\nSELECT count(*)::int AS fx_applied FROM applied;",
+        "options": {
+          "queryReplacement": "={{ [ $('Validate API Response').first().json.window_from, $('Validate API Response').first().json.window_to ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Applies existing rates only. Non-USD rows stay NULL until the Frankfurter sync exists.",
+      "notesInFlow": false
+    },
+    {
+      "id": "finalize-ingestion-run",
+      "name": "Finalize Ingestion Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1740,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Close the run. status is derived, never asserted: a run that rejected\n-- anything is 'partial', so a green tick can never hide a dead-letter pile.\n-- The counts-balance CHECK on ingestion_runs rejects arithmetic that does not\n-- add up, which turns a silent pipeline bug into a loud constraint violation.\nUPDATE salesops.ingestion_runs r\nSET finished_at       = now(),\n    records_received  = $2::int,\n    records_accepted  = $3::int,\n    records_rejected  = $4::int,\n    records_duplicate = $5::int,\n    status            = CASE WHEN $4::int > 0 THEN 'partial' ELSE 'success' END\nWHERE r.batch_id = $1::uuid\nRETURNING\n    run_id,\n    batch_id::text    AS batch_id,\n    window_from::text AS window_from,\n    window_to::text   AS window_to,\n    status,\n    records_received,\n    records_accepted,\n    records_rejected,\n    records_duplicate,\n    round(extract(epoch FROM (finished_at - started_at))::numeric, 2) AS duration_seconds,\n    (SELECT count(*) FROM salesops.fact_orders f\n      WHERE f.exchange_rate_to_usd IS NULL\n        AND f.order_date BETWEEN r.window_from AND r.window_to)::int AS orders_awaiting_fx;",
+        "options": {
+          "queryReplacement": "={{ [ $('Validate API Response').first().json.batch_id, $('Validate API Response').first().json.records_received || 0, $('Insert Facts').first().json.records_accepted || 0, $('Validate Orders').first().json.records_rejected || 0, $('Insert Facts').first().json.records_duplicate || 0 ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Derives success vs partial from the counts. Never asserts success.",
+      "notesInFlow": false
+    }
+  ],
+  "connections": {
+    "Schedule - Hourly": {
+      "main": [
+        [
+          {
+            "node": "Create Batch Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Run": {
+      "main": [
+        [
+          {
+            "node": "Create Batch Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Batch Context": {
+      "main": [
+        [
+          {
+            "node": "Fetch Orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Orders": {
+      "main": [
+        [
+          {
+            "node": "Validate API Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate API Response": {
+      "main": [
+        [
+          {
+            "node": "Stage Raw Orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage Raw Orders": {
+      "main": [
+        [
+          {
+            "node": "Validate Orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Orders": {
+      "main": [
+        [
+          {
+            "node": "Resolve Customers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Customers": {
+      "main": [
+        [
+          {
+            "node": "Insert Facts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Facts": {
+      "main": [
+        [
+          {
+            "node": "Ensure USD Identity Rate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ensure USD Identity Rate": {
+      "main": [
+        [
+          {
+            "node": "Attach Available FX",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Available FX": {
+      "main": [
+        [
+          {
+            "node": "Finalize Ingestion Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "salesopsErrors001",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true
+  },
+  "tags": []
+}

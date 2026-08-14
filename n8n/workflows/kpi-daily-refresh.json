@@ -1,0 +1,172 @@
+{
+  "id": "salesopsKpiRfr001",
+  "name": "KPI Daily Refresh",
+  "active": false,
+  "nodes": [
+    {
+      "id": "schedule-daily",
+      "name": "Schedule - Daily",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -520,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 6,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "notes": "One hour after the FX sync, so the day's rates are already attached."
+    },
+    {
+      "id": "manual-run",
+      "name": "Manual Run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -520,
+        460
+      ],
+      "parameters": {},
+      "notes": "On-demand run for backfills, demos and CLI execution. Same path as the schedule."
+    },
+    {
+      "id": "open-kpi-refresh-run",
+      "name": "Open KPI Refresh Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -300,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Open the run ledger entry. Same shared table, source='kpi-refresh'.\n--\n-- The window is the span of sales dates the rebuild will cover, so the ledger\n-- answers \"which dates did this refresh account for?\" without reading kpi_daily.\nWITH span AS (\n    SELECT min(order_date) AS from_date, max(order_date) AS to_date\n    FROM salesops.fact_orders\n)\nINSERT INTO salesops.ingestion_runs\n    (batch_id, source, window_from, window_to, status, n8n_execution_id)\nSELECT\n    gen_random_uuid(),\n    'kpi-refresh',\n    COALESCE((SELECT from_date FROM span), CURRENT_DATE),\n    COALESCE((SELECT to_date   FROM span), CURRENT_DATE),\n    'running',\n    $1\nRETURNING\n    batch_id::text    AS batch_id,\n    window_from::text AS window_from,\n    window_to::text   AS window_to,\n    run_id;",
+        "options": {
+          "queryReplacement": "={{ [ $execution.id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Opens ingestion_runs with source='kpi-refresh'.",
+      "notesInFlow": false
+    },
+    {
+      "id": "rebuild-kpi-daily",
+      "name": "Rebuild KPI Daily",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -60,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Full deterministic rebuild of kpi_daily.\n--\n-- The DELETE and the INSERT live inside salesops.refresh_kpi_daily() rather\n-- than in two n8n nodes, because they must be atomic. A function body runs in\n-- the caller's transaction, so a failure rolls back the DELETE too and the\n-- previous contents survive. Two nodes would leave a window in which kpi_daily\n-- was empty, and any reader in that window would see a warehouse with no\n-- history.\n--\n-- Rebuilding wholesale rather than incrementally is a deliberate choice: the\n-- table is one row per trading day, so a rebuild is cheaper than the\n-- bookkeeping an incremental strategy would need - and it cannot drift from\n-- fact_orders.\nSELECT * FROM salesops.refresh_kpi_daily();",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Calls salesops.refresh_kpi_daily(). Atomic full rebuild - never half-written.",
+      "notesInFlow": false
+    },
+    {
+      "id": "finalize-kpi-refresh-run",
+      "name": "Finalize KPI Refresh Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Close the run.\n--\n-- 'partial' means \"completed, but the result is not fully trustworthy\": here,\n-- at least one date still has orders with no exchange rate, so its money\n-- columns are understated. The run genuinely succeeded - the DATA is\n-- incomplete - and conflating the two would either hide the gap or cry wolf.\n--\n-- records_received = dates considered, records_accepted = KPI rows written.\n-- They are equal by construction (one row per date), which satisfies the\n-- counts-balance CHECK on ingestion_runs.\nUPDATE salesops.ingestion_runs r\nSET finished_at       = now(),\n    records_received  = $2::int,\n    records_accepted  = $2::int,\n    records_rejected  = 0,\n    records_duplicate = 0,\n    status            = CASE WHEN $3::int > 0 THEN 'partial' ELSE 'success' END\nWHERE r.batch_id = $1::uuid\nRETURNING\n    run_id,\n    batch_id::text AS batch_id,\n    status,\n    records_accepted AS kpi_dates_written,\n    $3::int          AS kpi_dates_incomplete,\n    (SELECT count(*) FROM salesops.kpi_daily)::int          AS kpi_rows_total,\n    (SELECT min(calendar_date) FROM salesops.kpi_daily)     AS earliest_date,\n    (SELECT max(calendar_date) FROM salesops.kpi_daily)     AS latest_date,\n    (SELECT round(avg(fx_completeness_pct), 2) FROM salesops.kpi_daily) AS avg_fx_completeness_pct,\n    round(extract(epoch FROM (finished_at - started_at))::numeric, 2)   AS duration_seconds;",
+        "options": {
+          "queryReplacement": "={{ [ $('Open KPI Refresh Run').first().json.batch_id, $('Rebuild KPI Daily').first().json.dates_written || 0, $('Rebuild KPI Daily').first().json.dates_incomplete || 0 ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "'partial' when any date still lacks full FX coverage.",
+      "notesInFlow": false
+    }
+  ],
+  "connections": {
+    "Schedule - Daily": {
+      "main": [
+        [
+          {
+            "node": "Open KPI Refresh Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Run": {
+      "main": [
+        [
+          {
+            "node": "Open KPI Refresh Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open KPI Refresh Run": {
+      "main": [
+        [
+          {
+            "node": "Rebuild KPI Daily",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rebuild KPI Daily": {
+      "main": [
+        [
+          {
+            "node": "Finalize KPI Refresh Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "salesopsErrors001",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true
+  },
+  "tags": []
+}

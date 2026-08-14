@@ -1,0 +1,99 @@
+{
+  "id": "salesopsErrors001",
+  "name": "Pipeline Error Handler",
+  "active": true,
+  "nodes": [
+    {
+      "id": "error-trigger",
+      "name": "Pipeline Failure",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -200,
+        300
+      ],
+      "parameters": {},
+      "notes": "Fires for any workflow naming this one as its error workflow."
+    },
+    {
+      "id": "log-pipeline-error",
+      "name": "Log Pipeline Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        40,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Persist the failure. Stage 3 stops at recording it; Slack and escalation\n-- are Stage 10's job, and they will read this table rather than replace it.\n--\n-- The full trigger payload goes into context as JSONB because the shape of an\n-- n8n error object is not ours to control and changes between versions.\nINSERT INTO salesops.pipeline_errors\n    (workflow_id, workflow_name, execution_id, node_name,\n     error_message, error_stack, context)\nVALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)\nRETURNING error_id, occurred_at, workflow_name, node_name;",
+        "options": {
+          "queryReplacement": "={{ [ $json.workflow?.id ?? null, $json.workflow?.name ?? 'unknown workflow', $json.execution?.id ?? null, $json.execution?.lastNodeExecuted ?? null, $json.execution?.error?.message ?? 'unknown error', $json.execution?.error?.stack ?? null, JSON.stringify($json) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Writes to salesops.pipeline_errors.",
+      "notesInFlow": false
+    },
+    {
+      "id": "fail-ingestion-run",
+      "name": "Fail Ingestion Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        280,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Close out the ingestion run this execution belongs to.\n--\n-- Matching on n8n_execution_id is why that column exists: without it a crashed\n-- run would sit at 'running' forever and every later run would recompute its\n-- window from a stale successful one.\n--\n-- Guarded on status = 'running' so a run that already finished is never\n-- retro-actively marked failed. Zero rows updated is a valid outcome - the\n-- failure may have happened before the run row was created.\nUPDATE salesops.ingestion_runs\nSET status        = 'failed',\n    finished_at   = now(),\n    error_message = COALESCE($2, 'unknown error')\nWHERE n8n_execution_id = $1\n  AND status = 'running'\nRETURNING run_id, batch_id::text AS batch_id, status, error_message;",
+        "options": {
+          "queryReplacement": "={{ [ $('Pipeline Failure').first().json.execution?.id ?? null, $('Pipeline Failure').first().json.execution?.error?.message ?? 'unknown error' ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Flips the matching ingestion_runs row from 'running' to 'failed'.",
+      "notesInFlow": false
+    }
+  ],
+  "connections": {
+    "Pipeline Failure": {
+      "main": [
+        [
+          {
+            "node": "Log Pipeline Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Pipeline Error": {
+      "main": [
+        [
+          {
+            "node": "Fail Ingestion Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": []
+}

@@ -1,0 +1,316 @@
+{
+  "id": "salesopsFxSync001",
+  "name": "FX Rate Sync",
+  "active": false,
+  "nodes": [
+    {
+      "id": "schedule-daily",
+      "name": "Schedule - Daily",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -520,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 5,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "notes": "Runs before the KPI refresh so the day's rates are in place when KPIs rebuild."
+    },
+    {
+      "id": "manual-run",
+      "name": "Manual Run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -520,
+        460
+      ],
+      "parameters": {},
+      "notes": "On-demand run for backfills, demos and CLI execution. Same path as the schedule."
+    },
+    {
+      "id": "open-fx-sync-run",
+      "name": "Open FX Sync Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -300,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Open the run ledger entry before calling anything external.\n--\n-- ingestion_runs is shared by every scheduled pipeline; `source` says which.\n-- A crash after this point leaves a visible 'running' row rather than silence.\n--\n-- Window: the span of order dates that still lack a rate, widened backwards by\n-- 7 days. The widening matters - if the earliest\n-- unconverted order falls on a Saturday, the rate that applies to it was\n-- published on the Friday, which is outside the order-date span.\nWITH pending AS (\n    SELECT min(order_date) AS from_date,\n           max(order_date) AS to_date\n    FROM salesops.fact_orders\n    WHERE exchange_rate_to_usd IS NULL\n      AND currency <> 'USD'\n)\nINSERT INTO salesops.ingestion_runs\n    (batch_id, source, window_from, window_to, status, n8n_execution_id)\nSELECT\n    gen_random_uuid(),\n    'frankfurter',\n    COALESCE(\n        (SELECT from_date FROM pending) - INTERVAL '7 days',\n        CURRENT_DATE - INTERVAL '7 days'\n    )::date,\n    COALESCE((SELECT to_date FROM pending), CURRENT_DATE),\n    'running',\n    $1\nRETURNING\n    batch_id::text    AS batch_id,\n    window_from::text AS window_from,\n    window_to::text   AS window_to,\n    run_id;",
+        "options": {
+          "queryReplacement": "={{ [ $execution.id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Opens ingestion_runs with source='frankfurter' and computes the date window.",
+      "notesInFlow": false
+    },
+    {
+      "id": "currencies-to-sync",
+      "name": "Currencies To Sync",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -80,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- One row per non-USD currency the sales data actually uses.\n--\n-- Derived from fact_orders rather than hardcoded, so a new billing currency\n-- appearing upstream is picked up without editing this workflow.\n--\n-- USD is excluded deliberately: Frankfurter has no USD/USD pair, and the\n-- identity rate (USD -> 1.0, source 'identity') is written by the ingestion\n-- pipeline. Asking a rates provider for it would be asking for a number that\n-- is definitionally 1.\nSELECT DISTINCT\n    f.currency,\n    $2::text AS window_from,\n    $3::text AS window_to,\n    $1::text AS batch_id\nFROM salesops.fact_orders f\nWHERE f.currency <> 'USD'\nORDER BY f.currency;",
+        "options": {
+          "queryReplacement": "={{ [ $json.batch_id, $json.window_from, $json.window_to ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "One row per non-USD currency in the sales data. USD is the identity rate, not fetched.",
+      "notesInFlow": false
+    },
+    {
+      "id": "fetch-rates",
+      "name": "Fetch Rates",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        140,
+        300
+      ],
+      "parameters": {
+        "url": "=https://api.frankfurter.dev/v1/{{ $json.window_from }}..{{ $json.window_to }}",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "base",
+              "value": "={{ $json.currency }}"
+            },
+            {
+              "name": "symbols",
+              "value": "USD"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "notes": "base=<CCY>&symbols=USD gives rate_to_usd directly - no inversion arithmetic. 3 attempts, 5s apart. A failure stops the run; no rate is ever invented."
+    },
+    {
+      "id": "store-rates",
+      "name": "Store Rates",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        360,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Store exactly what Frankfurter published, and nothing else.\n--\n-- The response is { \"rates\": { \"2026-05-12\": {\"USD\": 1.1738}, ... } }. Only\n-- ECB business days appear - weekends and market holidays are simply absent\n-- from the payload. They are NOT filled in here. This table stays a faithful\n-- record of what the provider actually published; the rule for applying a rate\n-- to a non-trading day lives in the attach step, where it is visible and\n-- bounded.\n--\n-- ON CONFLICT DO NOTHING: providers revise history, and the rate we applied is\n-- the rate we keep, so a report re-run next year reproduces itself. It is also\n-- what makes this whole workflow safe to run repeatedly.\nWITH incoming AS (\n    SELECT\n        (d.key)::date                        AS rate_date,\n        (d.value ->> 'USD')::numeric(18,8)   AS rate_to_usd\n    FROM jsonb_each($2::jsonb) AS d\n    WHERE (d.value ->> 'USD') IS NOT NULL\n),\nstored AS (\n    INSERT INTO salesops.exchange_rates (rate_date, currency, rate_to_usd, source)\n    SELECT rate_date, $1, rate_to_usd, 'frankfurter'\n    FROM incoming\n    WHERE rate_to_usd > 0\n    ON CONFLICT (rate_date, currency) DO NOTHING\n    RETURNING 1\n)\nSELECT\n    $1                                        AS currency,\n    (SELECT count(*) FROM incoming)::int      AS rates_received,\n    (SELECT count(*) FROM stored)::int        AS rates_inserted;",
+        "options": {
+          "queryReplacement": "={{ [ $('Currencies To Sync').item.json.currency, JSON.stringify($json.rates ?? {}) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Stores only the business days Frankfurter published. ON CONFLICT DO NOTHING.",
+      "notesInFlow": false
+    },
+    {
+      "id": "summarise-fetch",
+      "name": "Summarise Fetch",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        580,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Collapse the per-currency results into one item.\n//\n// The fetch and store nodes run once per currency; the attach step must run\n// exactly once. Without this the UPDATE would fire four times - idempotent, but\n// it would report four partial counts instead of one true one.\n\nconst batch = $('Open FX Sync Run').first().json;\nconst results = $input.all().map((item) => item.json);\n\nif (results.length === 0) {\n  throw new Error('No currency results reached the summariser - the fetch produced nothing');\n}\n\nconst total = (field) =>\n  results.reduce((sum, row) => sum + (Number(row[field]) || 0), 0);\n\nreturn [{\n  json: {\n    batch_id: batch.batch_id,\n    window_from: batch.window_from,\n    window_to: batch.window_to,\n    currencies_synced: results.length,\n    rates_received: total('rates_received'),\n    rates_inserted: total('rates_inserted'),\n    per_currency: results.map((r) => `${r.currency}:${r.rates_received}`).join(' '),\n  },\n}];"
+      },
+      "notes": "Collapses per-currency results to one item so the attach step runs once."
+    },
+    {
+      "id": "attach-fx-to-orders",
+      "name": "Attach FX To Orders",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        800,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Attach the applicable rate to every order still lacking one.\n--\n-- An exact-date match is preferred, but FX is not published at weekends or on\n-- market holidays while orders keep arriving. The applicable rate for a\n-- non-trading day is the last one published before it - standard practice, and\n-- the reason this is a LATERAL lookup rather than an equi-join.\n--\n-- Without it, 26 weekend dates in the current\n-- dataset could never be converted and is_complete would be false forever.\n--\n-- The 7-day bound is the safety valve: a two-day\n-- weekend is normal, a three-week gap means the feed is broken and those orders\n-- must stay visibly pending rather than silently inherit a stale rate.\n--\n-- Only rows with no rate are touched, so a rate already applied is never\n-- rewritten. The generated USD columns recompute themselves from this update -\n-- nothing here writes a money value.\nWITH applicable AS (\n    SELECT f.order_id, r.rate_to_usd\n    FROM salesops.fact_orders f\n    CROSS JOIN LATERAL (\n        SELECT x.rate_to_usd\n        FROM salesops.exchange_rates x\n        WHERE x.currency   = f.currency\n          AND x.rate_date <= f.order_date\n          AND x.rate_date >= f.order_date - INTERVAL '7 days'\n        ORDER BY x.rate_date DESC\n        LIMIT 1\n    ) AS r\n    WHERE f.exchange_rate_to_usd IS NULL\n),\napplied AS (\n    UPDATE salesops.fact_orders f\n    SET exchange_rate_to_usd = a.rate_to_usd\n    FROM applicable a\n    WHERE f.order_id = a.order_id\n    RETURNING 1\n)\nSELECT count(*)::int AS orders_attached FROM applied;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Carry-forward lookup: last rate published on or before the order date, within 7 days. Only fills rows that have none.",
+      "notesInFlow": false
+    },
+    {
+      "id": "finalize-fx-sync-run",
+      "name": "Finalize FX Sync Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1020,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Close the run.\n--\n-- 'partial' means \"completed, but the result is not fully trustworthy\": here,\n-- the provider returned nothing while orders were still waiting for a rate.\n-- Orders left pending for a legitimate reason (no rate published that far back)\n-- are reported through orders_still_pending rather than failing the run - the\n-- KPI layer's fx_completeness_pct is where coverage is judged.\nUPDATE salesops.ingestion_runs r\nSET finished_at       = now(),\n    records_received  = $2::int,\n    records_accepted  = $3::int,\n    records_rejected  = 0,\n    records_duplicate = $2::int - $3::int,\n    status = CASE\n        WHEN $2::int = 0\n         AND EXISTS (SELECT 1 FROM salesops.fact_orders\n                     WHERE exchange_rate_to_usd IS NULL AND currency <> 'USD')\n        THEN 'partial'\n        ELSE 'success'\n    END\nWHERE r.batch_id = $1::uuid\nRETURNING\n    run_id,\n    batch_id::text    AS batch_id,\n    window_from::text AS window_from,\n    window_to::text   AS window_to,\n    status,\n    records_received  AS rates_received,\n    records_accepted  AS rates_inserted,\n    records_duplicate AS rates_already_present,\n    (SELECT count(*) FROM salesops.fact_orders\n      WHERE exchange_rate_to_usd IS NULL)::int AS orders_still_pending,\n    round(extract(epoch FROM (finished_at - started_at))::numeric, 2) AS duration_seconds;",
+        "options": {
+          "queryReplacement": "={{ [ $('Open FX Sync Run').first().json.batch_id, $('Summarise Fetch').first().json.rates_received || 0, $('Summarise Fetch').first().json.rates_inserted || 0 ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Closes the run and reports how many orders remain unconverted.",
+      "notesInFlow": false
+    }
+  ],
+  "connections": {
+    "Schedule - Daily": {
+      "main": [
+        [
+          {
+            "node": "Open FX Sync Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Run": {
+      "main": [
+        [
+          {
+            "node": "Open FX Sync Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open FX Sync Run": {
+      "main": [
+        [
+          {
+            "node": "Currencies To Sync",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Currencies To Sync": {
+      "main": [
+        [
+          {
+            "node": "Fetch Rates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Rates": {
+      "main": [
+        [
+          {
+            "node": "Store Rates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Rates": {
+      "main": [
+        [
+          {
+            "node": "Summarise Fetch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarise Fetch": {
+      "main": [
+        [
+          {
+            "node": "Attach FX To Orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach FX To Orders": {
+      "main": [
+        [
+          {
+            "node": "Finalize FX Sync Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "salesopsErrors001",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true
+  },
+  "tags": []
+}
