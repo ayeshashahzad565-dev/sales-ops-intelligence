@@ -1,0 +1,286 @@
+{
+  "id": "salesopsNotify01",
+  "name": "Notification & Review Routing",
+  "active": false,
+  "nodes": [
+    {
+      "id": "schedule-daily",
+      "name": "Schedule - Daily",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -760,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 8,
+              "triggerAtMinute": 30
+            }
+          ]
+        }
+      },
+      "notes": "08:30, last in the chain. 05:00 FX -> 06:00 KPI -> 07:00 detect -> 07:30 decide -> 08:00 explain -> 08:30 deliver."
+    },
+    {
+      "id": "manual-run",
+      "name": "Manual Run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -760,
+        460
+      ],
+      "parameters": {},
+      "notes": "On-demand run for demos and retrying a failed delivery. Same path as the schedule."
+    },
+    {
+      "id": "open-routing-run",
+      "name": "Open Routing Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -520,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Open the run ledger entry. Shared table, source='notification-router'.\n--\n-- The same statement reports whether Stage 6 is in a state worth delivering,\n-- so the readiness check costs no extra round trip and is recorded against the\n-- run that acted on it.\n--\n-- \"Ready\" means Stage 6 decisions exist AND its most recent recorded run did\n-- not fail or hang. Delivering from a half-written decision pass would notify\n-- people about severities that are about to change - and a notification cannot\n-- be recalled.\n--\n-- Note what is NOT part of readiness: whether Stage 7 produced anything. A\n-- failed LLM analysis must never stop an escalation reaching a human; the\n-- review item is created either way and says the analysis was unavailable.\n-- Nor is the count of actionable anomalies: zero is a healthy week.\nWITH last_decision AS (\n    SELECT status\n    FROM salesops.ingestion_runs\n    WHERE source = 'anomaly-decision'\n    ORDER BY started_at DESC\n    LIMIT 1\n),\nactionable AS (\n    SELECT min(calendar_date) AS from_date,\n           max(calendar_date) AS to_date,\n           count(*)                                        AS n,\n           count(*) FILTER (WHERE routing = 'auto_notify')  AS to_notify,\n           count(*) FILTER (WHERE routing = 'human_review') AS to_review\n    FROM salesops.anomaly_decisions\n    WHERE decision_version = $2 AND decision = 'action_required'\n)\nINSERT INTO salesops.ingestion_runs\n    (batch_id, source, window_from, window_to, status, n8n_execution_id)\nSELECT\n    gen_random_uuid(),\n    'notification-router',\n    COALESCE((SELECT from_date FROM actionable), CURRENT_DATE),\n    COALESCE((SELECT to_date   FROM actionable), CURRENT_DATE),\n    'running',\n    $1\nRETURNING\n    batch_id::text    AS batch_id,\n    run_id,\n    window_from::text AS window_from,\n    window_to::text   AS window_to,\n    (SELECT n         FROM actionable)::int                      AS actionable_anomalies,\n    (SELECT to_notify FROM actionable)::int                      AS due_notification,\n    (SELECT to_review FROM actionable)::int                      AS due_review,\n    (SELECT count(*) FROM salesops.anomaly_decisions\n      WHERE decision_version = $2)::int                          AS decision_rows,\n    COALESCE((SELECT status FROM last_decision), 'none')         AS decision_status,\n    (\n        (SELECT count(*) FROM salesops.anomaly_decisions WHERE decision_version = $2) > 0\n        AND COALESCE((SELECT status FROM last_decision), 'none') NOT IN ('running', 'failed')\n    )                                                            AS stage6_ready;",
+        "options": {
+          "queryReplacement": "={{ [ $execution.id, 'stage6-v1' ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Opens ingestion_runs with source='notification-router' and reports Stage 6 readiness.",
+      "notesInFlow": false
+    },
+    {
+      "id": "stage6-ready",
+      "name": "Stage 6 Ready?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -280,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "stage6-ready-check",
+              "leftValue": "={{ $json.stage6_ready }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "A notification cannot be recalled, so nothing is delivered from a decision pass that is still in flight or that failed."
+    },
+    {
+      "id": "route-anomalies",
+      "name": "Route Anomalies",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -40,
+        220
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://analytics-service:8000/notifications/process",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ \"decision_version\": \"stage6-v1\", \"resend\": false }) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "onError": "continueErrorOutput",
+      "notes": "Service-name DNS, never localhost. NO WEBHOOK URL OR CREDENTIAL HERE - the service reads NOTIFICATION_WEBHOOK_URL and NOTIFICATION_RECIPIENTS from its own environment, so nothing sensitive enters this workflow, its execution history, or the n8n database. A webhook URL is a bearer token in URL form. NO SEVERITY LOGIC HERE either: the service reads Stage 6's routing columns, so this node decides nothing. resend stays false - a rerun must not tell somebody the same thing twice. Retry is safe because routing is idempotent. On failure it routes to the second output rather than throwing, so this workflow always closes its own ledger entry.",
+      "notesInFlow": false
+    },
+    {
+      "id": "finalize-routing-run",
+      "name": "Finalize Routing Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        220,
+        220
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Close the run, deriving the status from what the service actually did.\n--\n-- 'failed'  every delivery attempt failed and nothing was queued. The channel\n--           is down or misconfigured. Nothing about Stage 6 changed: the\n--           anomalies are as serious as they were, just undelivered.\n--\n-- 'partial' some deliveries failed while other work succeeded. Reported\n--           honestly rather than as success, because a caller reading only the\n--           status has to be able to trust it.\n--\n-- 'success' everything eligible was delivered or queued - or nothing was\n--           eligible, which is a quiet week rather than a fault.\n--\n-- records_received  = anomalies eligible for routing\n-- records_accepted  = notifications sent + review items created\n-- records_rejected  = deliveries that failed\n-- records_duplicate = already delivered or already queued\n-- The four balance by construction: every eligible anomaly gets exactly one\n-- outcome, which satisfies the counts CHECK on ingestion_runs.\nUPDATE salesops.ingestion_runs r\nSET finished_at       = now(),\n    records_received  = ($3::int + $4::int + $5::int + $6::int),\n    records_accepted  = ($3::int + $5::int),\n    records_rejected  = $4::int,\n    records_duplicate = $6::int,\n    status            = CASE\n                            WHEN $4::int > 0 AND ($3::int + $5::int) = 0 THEN 'failed'\n                            WHEN $4::int > 0                            THEN 'partial'\n                            ELSE 'success'\n                        END,\n    error_message     = CASE\n                            WHEN $4::int > 0\n                            THEN $4::text || ' delivery failure(s): ' || $7::text\n                        END\nWHERE r.batch_id = $1::uuid\nRETURNING\n    run_id,\n    batch_id::text    AS batch_id,\n    status,\n    $2::int           AS eligible,\n    $3::int           AS notifications_sent,\n    $4::int           AS notifications_failed,\n    $5::int           AS reviews_created,\n    $6::int           AS skipped,\n    (SELECT count(*) FROM salesops.notifications WHERE status = 'sent')::int\n                      AS notifications_sent_total,\n    (SELECT count(*) FROM salesops.notifications\n      WHERE status IN ('failed', 'abandoned'))::int              AS notifications_undelivered,\n    (SELECT count(*) FROM salesops.review_queue\n      WHERE status IN ('pending', 'in_review'))::int             AS reviews_open,\n    (SELECT count(*) FROM salesops.review_queue\n      WHERE status = 'pending')::int                             AS reviews_unclaimed,\n    round(extract(epoch FROM (finished_at - started_at))::numeric, 2) AS duration_seconds;",
+        "options": {
+          "queryReplacement": "={{ [ $('Open Routing Run').first().json.batch_id, $('Route Anomalies').first().json.eligible || 0, $('Route Anomalies').first().json.notifications_sent || 0, $('Route Anomalies').first().json.notifications_failed || 0, $('Route Anomalies').first().json.reviews_created || 0, $('Route Anomalies').first().json.skipped || 0, ($('Route Anomalies').first().json.failures || []).map(f => f.calendar_date + ' (' + f.reason + ')').join('; ').slice(0, 500) || 'none' ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Status derived from the service's own counts, not from having reached this node. Also reports the open review backlog.",
+      "notesInFlow": false
+    },
+    {
+      "id": "fail-routing-run",
+      "name": "Fail Routing Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        220,
+        60
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The service could not be reached, or refused the request outright: no\n-- webhook URL, no recipients, warehouse unreachable. Close the run as 'failed'\n-- with the reason.\n--\n-- This branch exists so the workflow always closes its own ledger entry. The\n-- error handler covers unexpected failures, but it is invoked by n8n and does\n-- not fire in every execution mode - and a run left at 'running' forever is\n-- indistinguishable from one still in flight.\n--\n-- Nothing about Stage 6 changes, and nothing about Stage 7 changes. The\n-- anomalies remain exactly as serious as they were; they are simply\n-- undelivered, which the next scheduled run will retry.\nUPDATE salesops.ingestion_runs r\nSET finished_at   = now(),\n    status        = 'failed',\n    error_message = left(\n        'Stage 8 routing could not run: ' || COALESCE($2::text, 'unknown error')\n        || '. No notifications were delivered and no review items were created; '\n        || 'Stage 6 decisions are unchanged.',\n        1000)\nWHERE r.batch_id = $1::uuid\nRETURNING\n    run_id,\n    batch_id::text AS batch_id,\n    status,\n    error_message,\n    (SELECT count(*) FROM salesops.anomaly_decisions\n      WHERE decision_version = 'stage6-v1' AND decision = 'action_required')::int\n                   AS anomalies_left_undelivered;",
+        "options": {
+          "queryReplacement": "={{ [ $('Open Routing Run').first().json.batch_id, ($json.error && ($json.error.message || $json.error.description)) || $json.message || 'the analytics service did not return a result' ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Closes the run as 'failed' when the service call itself fails. Stage 6 and Stage 7 are untouched.",
+      "notesInFlow": false
+    },
+    {
+      "id": "abort-stage6-not-ready",
+      "name": "Abort - Stage 6 Not Ready",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -40,
+        400
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Stage 6 is not in a deliverable state. Close the run as 'failed' with the\n-- reason, notify nobody, and queue nothing.\n--\n-- Delivering anyway would put severities in front of people that are about to\n-- change, and a notification cannot be recalled. A visible failed row is\n-- recoverable; a message already sent is not.\nUPDATE salesops.ingestion_runs r\nSET finished_at   = now(),\n    status        = 'failed',\n    error_message = format(\n        'Stage 6 not ready: %s decision row(s) for the requested version, last '\n        'anomaly-decision run status is %L. Nothing was delivered or queued.',\n        $2::text, $3::text)\nWHERE r.batch_id = $1::uuid\nRETURNING\n    run_id,\n    batch_id::text AS batch_id,\n    status,\n    error_message;",
+        "options": {
+          "queryReplacement": "={{ [ $('Open Routing Run').first().json.batch_id, $('Open Routing Run').first().json.decision_rows, $('Open Routing Run').first().json.decision_status ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Closes the run as 'failed' without delivering anything.",
+      "notesInFlow": false
+    }
+  ],
+  "connections": {
+    "Schedule - Daily": {
+      "main": [
+        [
+          {
+            "node": "Open Routing Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Run": {
+      "main": [
+        [
+          {
+            "node": "Open Routing Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open Routing Run": {
+      "main": [
+        [
+          {
+            "node": "Stage 6 Ready?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 6 Ready?": {
+      "main": [
+        [
+          {
+            "node": "Route Anomalies",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Abort - Stage 6 Not Ready",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Anomalies": {
+      "main": [
+        [
+          {
+            "node": "Finalize Routing Run",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fail Routing Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "salesopsErrors001",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true
+  },
+  "tags": []
+}
