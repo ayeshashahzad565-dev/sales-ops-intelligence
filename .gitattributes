@@ -1,0 +1,8 @@
+# Normalise line endings so files consumed inside Linux containers are never
+# checked out with CRLF on Windows.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary

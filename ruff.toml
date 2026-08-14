@@ -1,0 +1,52 @@
+# Lint configuration for every Python package in the repository.
+#
+#   python -m ruff check .
+#   python -m ruff format --diff .
+#
+# The rule set is deliberately small. A linter earns its place by catching real
+# defects - a name that does not exist, an import that does nothing, a zip that
+# silently truncates - and loses it the moment a reviewer starts reading past
+# the warnings.
+
+line-length = 100
+target-version = "py311"
+
+exclude = [".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache"]
+
+[lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes: undefined names, unused imports
+    "W",    # warnings
+    "B",    # bugbear: real traps, not style
+    "SIM",  # simplifications that improve readability
+    "UP",   # syntax available on the target version
+    "I",    # import ordering
+]
+
+ignore = [
+    # FastAPI's dependency-injection idiom IS a call in an argument default.
+    # Depends(), Query() and Body() are the framework's public API; rewriting
+    # them to satisfy the linter would make the code worse and less familiar.
+    "B008",
+    # `typing.Sequence` etc. still read more clearly in signatures here, and the
+    # runtime accepts both. Not worth a repo-wide churn for no behaviour change.
+    "UP035",
+]
+
+[lint.per-file-ignores]
+# Tests assert on long literal SQL and long expected strings. Wrapping those to
+# 100 columns hurts more than it helps.
+#
+# SIM117: the nested form
+#     with pytest.raises(CheckViolation):
+#         with connection.cursor() as cursor:
+# separates "this must be refused" from "this is the statement" on two lines.
+# Collapsing them onto one puts the assertion and the subject in the same
+# breath, which is harder to read in exactly the tests that matter most.
+"**/tests/*" = ["E501", "SIM117"]
+# The mock API's generator carries wide tuple signatures by design.
+"mock-api/app/store.py" = ["E501"]
+
+[lint.isort]
+known-first-party = ["analytics", "app", "tests"]

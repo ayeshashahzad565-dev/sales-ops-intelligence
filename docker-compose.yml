@@ -1,0 +1,269 @@
+name: sales-ops-intelligence
+
+# ---------------------------------------------------------------------------
+# Local development environment.
+#
+# Five services on one private bridge network. Containers address each other by
+# SERVICE NAME (postgres / mock-api / analytics-service / n8n / metabase), never
+# by localhost. Published host ports exist only for browser and psql access from
+# your machine - nothing inside the stack depends on them.
+#
+# Start everything, populated and ready to demonstrate, with ./bootstrap.sh.
+# ---------------------------------------------------------------------------
+
+services:
+
+  # --- PostgreSQL -----------------------------------------------------------
+  # Hosts three logical databases:
+  #   ${POSTGRES_DB}  -> analytics data (the pipeline's own database)
+  #   n8n             -> n8n internal state   (created by database/init)
+  #   metabase        -> Metabase app state   (created by database/init)
+  postgres:
+    image: postgres:17-alpine
+    container_name: salesops-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+      TZ: ${TZ}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Scripts here run ONCE, only when postgres_data is empty.
+      - ./database/init:/docker-entrypoint-initdb.d:ro
+      # Migrations, seeds and schema tests, read-only. Mounted rather than piped
+      # through the host shell so `psql -f` reads the files byte-for-byte -
+      # no encoding or line-ending surprises on Windows.
+      - ./database:/database:ro
+    ports:
+      - "${POSTGRES_HOST_PORT}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks:
+      - salesops
+
+  # --- Mock Sales / Orders API ---------------------------------------------
+  # Stands in for an internal ERP / order-management REST API.
+  # Reachable from n8n as: http://mock-api:8000
+  mock-api:
+    build:
+      context: ./mock-api
+    image: salesops/mock-api:0.1.0
+    container_name: salesops-mock-api
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+      MOCK_API_DATA_DIR: /data
+      # Defaults inline so a .env predating these keys starts without warnings.
+      # Safe to default: none of these are secrets. POSTGRES_PASSWORD and
+      # N8N_ENCRYPTION_KEY deliberately have no default - a default secret is a
+      # hardcoded secret.
+      MOCK_API_SEED: ${MOCK_API_SEED:-20260101}
+      MOCK_API_HISTORY_DAYS: ${MOCK_API_HISTORY_DAYS:-90}
+      # Blank anchors the history to today. Set a date to pin it exactly.
+      MOCK_API_HISTORY_END_DATE: ${MOCK_API_HISTORY_END_DATE:-}
+    volumes:
+      # Source is bind-mounted so --reload picks up edits without a rebuild.
+      - ./mock-api/app:/app/app:ro
+      # The order book. Generated once on first start, then mutated by the
+      # admin endpoints - so it has to outlive the container.
+      - mock_api_data:/data
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --reload
+    ports:
+      - "${MOCK_API_HOST_PORT}:8000"
+    healthcheck:
+      # python is guaranteed present in this image; curl is not.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      # Generating 90 days of history on a cold volume takes a few seconds.
+      start_period: 40s
+    networks:
+      - salesops
+
+  # --- Analytics service ----------------------------------------------------
+  # Stage 5 statistical anomaly detection. Reads salesops.kpi_daily, writes
+  # salesops.anomaly_daily. Reachable from n8n as: http://analytics-service:8000
+  #
+  # It is an HTTP service rather than a script because the n8n container has no
+  # Python runtime - this is how a workflow calls it without either side
+  # knowing anything about the other's internals.
+  analytics-service:
+    build:
+      context: ./analytics-service
+    image: salesops/analytics-service:1.0.0
+    container_name: salesops-analytics
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ}
+      ANALYTICS_DB_HOST: postgres
+      ANALYTICS_DB_PORT: 5432
+      ANALYTICS_DB_NAME: ${POSTGRES_DB}
+      ANALYTICS_DB_USER: ${POSTGRES_USER}
+      # No default: a default password is a hardcoded secret.
+      ANALYTICS_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      # --- Stage 7: the language model ------------------------------------
+      # Read only when an analysis is requested. Stage 5 detection works with
+      # every one of these unset, which is why none of them is required here.
+      #
+      # LLM_API_KEY has no default, for the same reason the database password
+      # has none. It reaches the provider in an Authorization header and goes
+      # nowhere else: not to the database, not to a workflow, not to a log.
+      LLM_PROVIDER: ${LLM_PROVIDER:-groq}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
+      LLM_MAX_OUTPUT_TOKENS: ${LLM_MAX_OUTPUT_TOKENS:-2000}
+      LLM_JSON_MODE: ${LLM_JSON_MODE:-schema}
+      # --- Stage 8: notification delivery ---------------------------------
+      # Read only when routing is requested. Stages 5-7 work with every one of
+      # these unset: no delivery channel means findings are not delivered, not
+      # that they stop being detected, decided or explained.
+      #
+      # NOTIFICATION_WEBHOOK_URL is a credential in URL form - a Slack or Teams
+      # webhook URL is a bearer token - so it has no default and is never
+      # persisted, logged, or included in an error message.
+      NOTIFICATION_PROVIDER: ${NOTIFICATION_PROVIDER:-webhook}
+      NOTIFICATION_WEBHOOK_URL: ${NOTIFICATION_WEBHOOK_URL:-}
+      NOTIFICATION_TIMEOUT_SECONDS: ${NOTIFICATION_TIMEOUT_SECONDS:-15}
+      NOTIFICATION_FROM: ${NOTIFICATION_FROM:-salesops-pipeline}
+      NOTIFICATION_RECIPIENTS: ${NOTIFICATION_RECIPIENTS:-}
+    volumes:
+      # Source is bind-mounted so --reload picks up edits without a rebuild.
+      - ./analytics-service/analytics:/app/analytics:ro
+    command:
+      - uvicorn
+      - analytics.api:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --reload
+    ports:
+      - "${ANALYTICS_API_HOST_PORT:-8001}:8000"
+    healthcheck:
+      # python is guaranteed present in this image; curl is not.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    networks:
+      - salesops
+
+  # --- n8n ------------------------------------------------------------------
+  # Orchestrator. Talks to postgres:5432 and mock-api:8000 over the network below.
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:${N8N_IMAGE_TAG}
+    container_name: salesops-n8n
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # n8n's own state lives in Postgres, not SQLite.
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+
+      N8N_HOST: ${N8N_HOST}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      WEBHOOK_URL: ${N8N_WEBHOOK_URL}
+
+      # Encrypts stored credentials. Must stay stable or credentials break.
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      GENERIC_TIMEZONE: ${TZ}
+      TZ: ${TZ}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      # Version-controlled workflow JSON, for import/export in later stages.
+      - ./n8n/workflows:/workflows
+    ports:
+      - "${N8N_HOST_PORT}:5678"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:5678/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 45s
+    networks:
+      - salesops
+
+  # --- Metabase -------------------------------------------------------------
+  # BI layer. Its app state is the `metabase` database; the analytics database
+  # is added later as a separate, read-only reporting connection.
+  metabase:
+    image: metabase/metabase:${METABASE_IMAGE_TAG}
+    container_name: salesops-metabase
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_HOST: postgres
+      MB_DB_PORT: 5432
+      MB_DB_DBNAME: metabase
+      MB_DB_USER: ${POSTGRES_USER}
+      MB_DB_PASS: ${POSTGRES_PASSWORD}
+      MB_SITE_URL: ${METABASE_SITE_URL}
+      JAVA_TIMEZONE: ${TZ}
+      TZ: ${TZ}
+    volumes:
+      # Downloaded JDBC drivers. Real state is in Postgres.
+      - metabase_plugins:/plugins
+    ports:
+      - "${METABASE_HOST_PORT}:3000"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--output", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 120s
+    networks:
+      - salesops
+
+networks:
+  salesops:
+    name: salesops
+    driver: bridge
+
+volumes:
+  postgres_data:
+  n8n_data:
+  metabase_plugins:
+  mock_api_data:
