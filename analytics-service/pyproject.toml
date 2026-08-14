@@ -1,0 +1,7 @@
+# Pytest configuration only. The analytics service is run as an application,
+# not installed as a package, so there is no build-system section here.
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"

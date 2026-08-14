@@ -1,0 +1,198 @@
+{
+  "id": "salesopsDetect001",
+  "name": "Statistical Anomaly Detection",
+  "active": false,
+  "nodes": [
+    {
+      "id": "schedule-daily",
+      "name": "Schedule - Daily",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -520,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 7,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "notes": "07:00 - an hour after the KPI refresh, so the day's KPIs are already rebuilt. FX 05:00 -> KPI 06:00 -> detection 07:00."
+    },
+    {
+      "id": "manual-run",
+      "name": "Manual Run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -520,
+        460
+      ],
+      "parameters": {},
+      "notes": "On-demand run for backfills, demos and CLI execution. Same path as the schedule."
+    },
+    {
+      "id": "open-detection-run",
+      "name": "Open Detection Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -280,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Open the run ledger entry before the detector is called.\n--\n-- ingestion_runs is shared by every scheduled pipeline; source says which.\n-- A crash after this point leaves a visible 'running' row rather than silence.\n--\n-- The window is the span of KPI dates the detector will consider, so the ledger\n-- answers \"which dates did this run account for?\" without reading anomaly_daily.\nWITH span AS (\n    SELECT min(calendar_date) AS from_date, max(calendar_date) AS to_date\n    FROM salesops.kpi_daily\n)\nINSERT INTO salesops.ingestion_runs\n    (batch_id, source, window_from, window_to, status, n8n_execution_id)\nSELECT\n    gen_random_uuid(),\n    'anomaly-detector',\n    COALESCE((SELECT from_date FROM span), CURRENT_DATE),\n    COALESCE((SELECT to_date   FROM span), CURRENT_DATE),\n    'running',\n    $1\nRETURNING\n    batch_id::text    AS batch_id,\n    window_from::text AS window_from,\n    window_to::text   AS window_to,\n    run_id;",
+        "options": {
+          "queryReplacement": "={{ [ $execution.id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Opens ingestion_runs with source='anomaly-detector'.",
+      "notesInFlow": false
+    },
+    {
+      "id": "run-detection",
+      "name": "Run Detection",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -40,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://analytics-service:8000/detect",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ \"mode\": \"full\" }) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "notes": "Service-name DNS, never localhost. Full recomputation: baselines look backwards, so new KPI data changes earlier verdicts. 3 attempts, 5s apart; the service returns 503 on failure so a failed run is never mistaken for a run that found nothing."
+    },
+    {
+      "id": "validate-detection-result",
+      "name": "Validate Detection Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Guard the boundary with the analytics service.\n//\n// The HTTP node already fails on a non-2xx status. What it cannot judge is\n// whether a 200 response is the payload we expect. Throwing here stops the\n// workflow, so a malformed response can never be finalised as a clean run.\n\nconst body = $input.first().json;\n\nif (body === null || typeof body !== 'object') {\n  throw new Error(`Analytics service returned a ${typeof body} rather than a JSON object`);\n}\n\nfor (const field of ['dates_evaluated', 'dates_written', 'dates_incomplete_kpi']) {\n  if (typeof body[field] !== 'number') {\n    throw new Error(\n      `Analytics service response is missing numeric \"${field}\". ` +\n      `Keys present: ${Object.keys(body).join(', ') || '<none>'}`\n    );\n  }\n}\n\nif (!body.detector_version) {\n  throw new Error('Analytics service response carries no detector_version');\n}\n\n// Every evaluated date must produce a result row - scored or explicitly\n// unscored. A shortfall means results were silently dropped.\nif (body.dates_written !== body.dates_evaluated) {\n  throw new Error(\n    `Detector wrote ${body.dates_written} results for ${body.dates_evaluated} ` +\n    `evaluated dates - some were lost`\n  );\n}\n\nreturn [{ json: body }];"
+      },
+      "notes": "Shape check. Throws if results were dropped or the payload is malformed."
+    },
+    {
+      "id": "finalize-detection-run",
+      "name": "Finalize Detection Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Close the run.\n--\n-- Success is derived from what the detector actually processed, never from the\n-- workflow having reached this node. A run that evaluated nothing is not a\n-- success, and a run that hit KPI rows it could not score is only a partial one.\n--\n-- Count semantics, chosen to satisfy the ingestion_runs balance CHECK\n-- (received = accepted + rejected + duplicate):\n--\n--   received  = KPI dates evaluated\n--   accepted  = results written (scored or explicitly unscored - every date\n--               evaluated gets a row, so nothing is silently dropped)\n--   rejected  = dates whose KPI row lacked FX coverage. A real data gap, and\n--               the only condition that makes this run 'partial'.\n--   duplicate = 0. Results are upserted in place, so a re-run overwrites rather\n--               than duplicating; there is no \"already present\" category.\n--\n-- Dates skipped for insufficient history are NOT rejections. Early in a series\n-- there is genuinely nothing to compare against; that is a correct outcome, and\n-- treating it as a fault would leave every run permanently 'partial' and train\n-- the reader to ignore the status.\nUPDATE salesops.ingestion_runs r\nSET finished_at       = now(),\n    records_received  = $2::int,\n    records_accepted  = $3::int,\n    records_rejected  = $4::int,\n    records_duplicate = 0,\n    status            = CASE\n        WHEN $2::int = 0 THEN 'partial'\n        WHEN $4::int > 0 THEN 'partial'\n        ELSE 'success'\n    END,\n    error_message     = NULL\nWHERE r.batch_id = $1::uuid\nRETURNING\n    run_id,\n    batch_id::text AS batch_id,\n    status,\n    records_received  AS dates_evaluated,\n    records_accepted  AS results_written,\n    records_rejected  AS dates_incomplete_kpi,\n    (SELECT count(*) FROM salesops.anomaly_daily\n      WHERE detector_version = $5 AND is_anomaly)::int         AS anomalies_flagged,\n    (SELECT count(*) FROM salesops.anomaly_daily\n      WHERE detector_version = $5 AND baseline_status = 'scored')::int AS dates_scored,\n    (SELECT round(max(anomaly_score), 2) FROM salesops.anomaly_daily\n      WHERE detector_version = $5)                             AS highest_score,\n    round(extract(epoch FROM (finished_at - started_at))::numeric, 2) AS duration_seconds;",
+        "options": {
+          "queryReplacement": "={{ [ $('Open Detection Run').first().json.batch_id, $json.dates_evaluated || 0, $json.dates_written || 0, $json.dates_incomplete_kpi || 0, $json.detector_version ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Derives success vs partial from what was actually processed.",
+      "notesInFlow": false
+    }
+  ],
+  "connections": {
+    "Schedule - Daily": {
+      "main": [
+        [
+          {
+            "node": "Open Detection Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Run": {
+      "main": [
+        [
+          {
+            "node": "Open Detection Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open Detection Run": {
+      "main": [
+        [
+          {
+            "node": "Run Detection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Detection": {
+      "main": [
+        [
+          {
+            "node": "Validate Detection Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Detection Result": {
+      "main": [
+        [
+          {
+            "node": "Finalize Detection Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "salesopsErrors001",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true
+  },
+  "tags": []
+}

@@ -1,0 +1,20 @@
+# Pinned to compatible ranges rather than exact versions so a fresh clone
+# builds cleanly, while majors stay locked against breaking changes.
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+pydantic>=2.7,<3.0
+
+# PostgreSQL driver. psycopg 3 with the binary wheel - no libpq build step.
+psycopg[binary]>=3.1,<4.0
+
+# HTTP client for the Stage 7 LLM provider. Chosen over a vendor SDK because the
+# provider speaks the OpenAI chat-completions dialect, which Groq, OpenAI and
+# most local runtimes all serve - so one small client covers all of them, and
+# swapping provider is a base URL rather than a dependency change.
+httpx>=0.27,<1.0
+
+# Deliberately absent: numpy, pandas, scipy, statsmodels, scikit-learn.
+# The series is ~90 observations and every operation is a sort or a mean over a
+# handful of values. Standard-library arithmetic keeps each formula visible in
+# the code that computes it and makes the unit tests exact. See
+# analytics/statistics.py for the full reasoning.
