@@ -1,0 +1,286 @@
+{
+  "id": "salesopsRemed01",
+  "name": "Remediation Execution",
+  "active": false,
+  "nodes": [
+    {
+      "id": "schedule-daily",
+      "name": "Schedule - Daily",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -760,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 9,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "notes": "09:00, after delivery. 05:00 FX -> 06:00 KPI -> 07:00 detect -> 07:30 decide -> 08:00 explain -> 08:30 deliver -> 09:00 execute what a human approved."
+    },
+    {
+      "id": "manual-run",
+      "name": "Manual Run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -760,
+        460
+      ],
+      "parameters": {},
+      "notes": "On-demand run, for executing an approval without waiting for tomorrow. Same path as the schedule - it cannot approve anything either."
+    },
+    {
+      "id": "open-remediation-run",
+      "name": "Open Remediation Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -520,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Open the run ledger entry. Shared table, source='remediation-executor'.\n--\n-- The same statement counts the work waiting, so the readiness check costs no\n-- extra round trip and is recorded against the run that acted on it.\n--\n-- WHAT COUNTS AS WORK: rows in salesops.remediation_pending_execution, which\n-- contains only actions a human explicitly authorised (status 'approved', or\n-- 'failed' with retry budget left) and never one still 'proposed'. This\n-- workflow therefore selects nothing. It cannot grade an anomaly, cannot\n-- choose an action, and cannot authorise one - it runs what a person already\n-- said to run.\n--\n-- Note what is NOT part of readiness: whether Stage 6, 7 or 8 ran today.\n-- Remediation executes an approval a human gave, possibly days ago. Making it\n-- wait on an upstream pipeline would mean a failed FX sync could silently\n-- block an authorised investigation.\nWITH work AS (\n    SELECT count(*)                                              AS authorized,\n           count(*) FILTER (WHERE severity = 'critical')         AS critical,\n           count(*) FILTER (WHERE status   = 'failed')           AS retrying\n    FROM salesops.remediation_pending_execution\n),\nunauthorized AS (\n    SELECT count(*) AS n FROM salesops.remediation_actions WHERE status = 'proposed'\n)\nINSERT INTO salesops.ingestion_runs\n    (batch_id, source, window_from, window_to, status, n8n_execution_id)\nSELECT\n    gen_random_uuid(),\n    'remediation-executor',\n    COALESCE((SELECT min(calendar_date) FROM salesops.remediation_pending_execution),\n             CURRENT_DATE),\n    COALESCE((SELECT max(calendar_date) FROM salesops.remediation_pending_execution),\n             CURRENT_DATE),\n    'running',\n    $1\nRETURNING\n    batch_id::text    AS batch_id,\n    run_id,\n    window_from::text AS window_from,\n    window_to::text   AS window_to,\n    (SELECT authorized FROM work)::int   AS authorized_actions,\n    (SELECT critical   FROM work)::int   AS critical_actions,\n    (SELECT retrying   FROM work)::int   AS retrying_actions,\n    -- Visible, and deliberately NOT actionable here: an action nobody has\n    -- authorised is not this workflow's to advance.\n    (SELECT n FROM unauthorized)::int    AS awaiting_authorization,\n    ((SELECT authorized FROM work) > 0)  AS has_authorized_work;",
+        "options": {
+          "queryReplacement": "={{ [ $execution.id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Opens ingestion_runs with source='remediation-executor' and counts the authorised work waiting. Reads remediation_pending_execution, which never contains an unauthorised action.",
+      "notesInFlow": false
+    },
+    {
+      "id": "has-authorized-work",
+      "name": "Approved Work Waiting?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -280,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-work-check",
+              "leftValue": "={{ $json.has_authorized_work }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "Stage 9 does nothing unless a human authorised something. That is the whole stage, and it is worth being visible in the shape of the workflow rather than only in the service."
+    },
+    {
+      "id": "execute-approved",
+      "name": "Execute Approved Actions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -40,
+        220
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://analytics-service:8000/remediation/execute-approved",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ \"limit\": 100, \"actor\": \"stage9-workflow\" }) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "onError": "continueErrorOutput",
+      "notes": "Service-name DNS, never localhost. NO CREDENTIALS HERE - the recording provider needs none, and a real provider would read its own from the service environment, never from this JSON or its execution history. NO ACTION SELECTION HERE either: the service reads remediation_pending_execution, so this node cannot choose what runs, and no LLM output reaches it in any form. `actor` is 'stage9-workflow' and never a person - the workflow executes; it does not approve. Retry is safe because execution is idempotent: claiming an action is a conditional UPDATE, so a second attempt runs only what did not complete. On failure it routes to the second output rather than throwing, so this workflow always closes its own ledger entry.",
+      "notesInFlow": false
+    },
+    {
+      "id": "finalize-remediation-run",
+      "name": "Finalize Remediation Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        220,
+        220
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Close the run, deriving the status from what the service actually did.\n--\n-- 'failed'  every authorised action failed to execute. Nothing about the\n--           approvals changed: they are still authorised, still unexecuted,\n--           and the next run retries them within the attempt budget.\n--\n-- 'partial' some executed and some did not. Reported honestly rather than as\n--           success, because a caller reading only the status has to be able\n--           to trust it.\n--\n-- 'success' everything authorised executed - or nothing was authorised, which\n--           is the normal state of a week in which nobody needed to act.\n--\n-- records_received  = authorised actions found waiting\n-- records_accepted  = executed\n-- records_rejected  = failed this run\n-- records_duplicate = claimed by another caller between read and write\n-- The four balance by construction: every action found gets exactly one\n-- outcome, which satisfies the counts CHECK on ingestion_runs.\nUPDATE salesops.ingestion_runs r\nSET finished_at       = now(),\n    records_received  = ($3::int + $4::int + $5::int),\n    records_accepted  = $3::int,\n    records_rejected  = $4::int,\n    records_duplicate = $5::int,\n    status            = CASE\n                            WHEN $4::int > 0 AND $3::int = 0 THEN 'failed'\n                            WHEN $4::int > 0                 THEN 'partial'\n                            ELSE 'success'\n                        END,\n    error_message     = CASE\n                            WHEN $4::int > 0\n                            THEN $4::text || ' execution failure(s): ' || $6::text\n                        END\nWHERE r.batch_id = $1::uuid\nRETURNING\n    run_id,\n    batch_id::text AS batch_id,\n    status,\n    $2::int        AS eligible,\n    $3::int        AS executed,\n    $4::int        AS failed,\n    $5::int        AS skipped,\n    (SELECT count(*) FROM salesops.remediation_actions\n      WHERE status = 'executed')::int                            AS executed_total,\n    (SELECT count(*) FROM salesops.remediation_actions\n      WHERE status = 'proposed')::int                            AS awaiting_authorization,\n    (SELECT count(*) FROM salesops.remediation_pending_execution)::int\n                                                                 AS still_pending,\n    -- Reported on every run rather than assumed. The development provider\n    -- records requests and contacts nothing, and this is the column that says\n    -- so out loud instead of leaving a reader to infer it.\n    COALESCE((SELECT bool_or(external_side_effect)\n              FROM salesops.remediation_attempts), FALSE)        AS any_external_side_effect,\n    round(extract(epoch FROM (finished_at - started_at))::numeric, 2) AS duration_seconds;",
+        "options": {
+          "queryReplacement": "={{ [ $('Open Remediation Run').first().json.batch_id, $('Execute Approved Actions').first().json.eligible || 0, $('Execute Approved Actions').first().json.executed || 0, $('Execute Approved Actions').first().json.failed || 0, $('Execute Approved Actions').first().json.skipped || 0, ($('Execute Approved Actions').first().json.failures || []).map(f => f.remediation_id + ' (' + f.reason + ')').join('; ').slice(0, 500) || 'none' ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Status derived from the service's own counts, not from having reached this node. Also reports how many actions are still waiting on a human to authorise them.",
+      "notesInFlow": false
+    },
+    {
+      "id": "fail-remediation-run",
+      "name": "Fail Remediation Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        220,
+        60
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The service could not be reached, or refused the request outright. Close the\n-- run as 'failed' with the reason.\n--\n-- This branch exists so the workflow always closes its own ledger entry. The\n-- error handler covers unexpected failures, but it is invoked by n8n and does\n-- not fire in every execution mode - and a run left at 'running' forever is\n-- indistinguishable from one still in flight.\n--\n-- Nothing about the approvals changes. Every authorised action is still\n-- authorised and still unexecuted; nothing was half-done, because an action is\n-- claimed before the provider is called and released to 'failed' after.\nUPDATE salesops.ingestion_runs r\nSET finished_at   = now(),\n    status        = 'failed',\n    error_message = left(\n        'Stage 9 execution could not run: ' || COALESCE($2::text, 'unknown error')\n        || '. No remediation was executed; every approval remains authorised and '\n        || 'unexecuted, and Stage 6, 7 and 8 records are unchanged.',\n        1000)\nWHERE r.batch_id = $1::uuid\nRETURNING\n    run_id,\n    batch_id::text AS batch_id,\n    status,\n    error_message,\n    (SELECT count(*) FROM salesops.remediation_pending_execution)::int\n                   AS actions_left_unexecuted;",
+        "options": {
+          "queryReplacement": "={{ [ $('Open Remediation Run').first().json.batch_id, ($json.error && ($json.error.message || $json.error.description)) || $json.message || 'the analytics service did not return a result' ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Closes the run as 'failed' when the service call itself fails. Approvals, decisions, hypotheses and notifications are all untouched.",
+      "notesInFlow": false
+    },
+    {
+      "id": "close-nothing-authorized",
+      "name": "Close - Nothing Authorized",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -40,
+        400
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Nobody authorised anything. Close the run as 'success' and call the service\n-- not at all.\n--\n-- This is a SUCCESS, not a no-op to be embarrassed about. A week in which no\n-- anomaly needed a human to authorise a response is a good week, and a stage\n-- that reported it as a failure would train people to ignore it.\n--\n-- The count of actions awaiting authorisation is recorded so that \"nothing\n-- ran\" can be told apart from \"nothing ran and four proposals are sitting\n-- there waiting for somebody\".\nUPDATE salesops.ingestion_runs r\nSET finished_at       = now(),\n    status            = 'success',\n    records_received  = 0,\n    records_accepted  = 0,\n    records_rejected  = 0,\n    records_duplicate = 0\nWHERE r.batch_id = $1::uuid\nRETURNING\n    run_id,\n    batch_id::text AS batch_id,\n    status,\n    $2::int        AS awaiting_authorization,\n    'No remediation was authorised for execution. Nothing was run.'::text AS note;",
+        "options": {
+          "queryReplacement": "={{ [ $('Open Remediation Run').first().json.batch_id, $('Open Remediation Run').first().json.awaiting_authorization ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Closes the run as 'success' without calling the service. No authorised work is the normal state, not a fault.",
+      "notesInFlow": false
+    }
+  ],
+  "connections": {
+    "Schedule - Daily": {
+      "main": [
+        [
+          {
+            "node": "Open Remediation Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Run": {
+      "main": [
+        [
+          {
+            "node": "Open Remediation Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open Remediation Run": {
+      "main": [
+        [
+          {
+            "node": "Approved Work Waiting?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approved Work Waiting?": {
+      "main": [
+        [
+          {
+            "node": "Execute Approved Actions",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Close - Nothing Authorized",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Approved Actions": {
+      "main": [
+        [
+          {
+            "node": "Finalize Remediation Run",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fail Remediation Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "salesopsErrors001",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true
+  },
+  "tags": []
+}
