@@ -1,0 +1,319 @@
+{
+  "id": "salesopsMaint01",
+  "name": "Operational Maintenance",
+  "active": false,
+  "nodes": [
+    {
+      "id": "schedule-daily",
+      "name": "Schedule - Daily",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -1000,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 9,
+              "triggerAtMinute": 30
+            }
+          ]
+        }
+      },
+      "notes": "09:30, after everything else has run and had a chance to fail. 05:00 FX -> 06:00 KPI -> 07:00 detect -> 07:30 decide -> 08:00 explain -> 08:30 deliver -> 09:00 execute -> 09:30 clean up after all of it."
+    },
+    {
+      "id": "manual-run",
+      "name": "Manual Run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1000,
+        460
+      ],
+      "parameters": {},
+      "notes": "On-demand run, for during an incident. Same path as the schedule and equally safe to repeat."
+    },
+    {
+      "id": "open-maintenance-run",
+      "name": "Open Maintenance Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -780,
+        380
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Open the run ledger entry. Shared table, source='operational-maintenance'.\n--\n-- Maintenance uses the same ledger as every other pipeline, deliberately: a\n-- maintenance run that crashed is exactly the kind of stuck 'running' row this\n-- workflow exists to find, and it should be able to find its own.\n--\n-- The window is today. Maintenance is not about a data window; the columns are\n-- NOT NULL, so they say when rather than pretending to say what.\nINSERT INTO salesops.ingestion_runs\n    (batch_id, source, window_from, window_to, status, n8n_execution_id)\nVALUES (gen_random_uuid(), 'operational-maintenance',\n        CURRENT_DATE, CURRENT_DATE, 'running', $1)\nRETURNING\n    batch_id::text AS batch_id,\n    run_id,\n    -- The state of the world before anything is recovered, so the finalize node\n    -- can report what changed rather than only what is left.\n    (SELECT count(*) FROM salesops.ingestion_runs\n      WHERE status = 'running'\n        AND started_at < now() - make_interval(mins => salesops.operational_setting('stale_run_timeout_minutes')::int)\n    )::int                                                      AS stale_runs_before,\n    (SELECT count(*) FROM salesops.remediation_actions\n      WHERE status = 'executing')::int                          AS executing_before,\n    (SELECT count(*) FROM salesops.ingestion_replay_candidates\n      WHERE replay_eligible)::int                               AS replay_candidates_before,\n    (SELECT overall_status FROM salesops.operational_health_summary) AS health_before;",
+        "options": {
+          "queryReplacement": "={{ [ $execution.id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Opens ingestion_runs with source='operational-maintenance' and snapshots the state of the world before anything is recovered.",
+      "notesInFlow": false
+    },
+    {
+      "id": "recover-stale-runs",
+      "name": "Recover Stale Runs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -540,
+        160
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Close runs abandoned at 'running' past the configured timeout.\n--\n-- RECOVERY, NOT RE-EXECUTION. The work is not repeated. Whether it should be\n-- is a separate question with a different answer per pipeline - the ingestion\n-- window self-heals on the next run, Stages 5-8 are idempotent, and Stage 9\n-- needs a human. This only stops the ledger lying about what is in flight.\n--\n-- This run's own row is younger than the timeout, so it cannot recover itself.\nSELECT\n    count(*)::int                                              AS recovered,\n    COALESCE(string_agg(source || '#' || run_id, ', '), 'none') AS detail\nFROM salesops.recover_stale_runs('stage10-recovery', FALSE);",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "Branch 1 of 5. onError=continueRegularOutput: these five operations are unrelated, and one being impossible says nothing about whether the others are. A maintenance workflow that abandoned the rest of its work on the first error would be a reliability feature that reduces reliability.",
+      "notesInFlow": false
+    },
+    {
+      "id": "recover-stale-remediation",
+      "name": "Recover Stale Remediation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -300,
+        160
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Move remediation actions stranded at 'executing' into 'execution_unknown'.\n--\n-- THIS CALLS NO PROVIDER, and that is the entire point. A process that died\n-- around a provider call may have completed the external call first. Both\n-- automatic answers are wrong: re-executing might do the thing twice, failing\n-- it might claim something did not happen when it did.\n--\n-- So the uncertainty is recorded rather than resolved. 'execution_unknown' is\n-- absent from remediation_pending_execution, so nothing picks it up\n-- automatically, and the only way out is a human reconciling it.\nSELECT\n    count(*)::int                                                  AS recovered,\n    COALESCE(string_agg(remediation_id::text, ', '), 'none')        AS detail,\n    (SELECT count(*) FROM salesops.remediation_actions\n      WHERE status = 'execution_unknown')::int                      AS awaiting_reconciliation\nFROM salesops.recover_stale_remediation('stage10-recovery', FALSE);",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "Branch 2 of 5. Never re-executes. An action whose outcome nobody knows is moved to a state that says so, and a human reconciles it.",
+      "notesInFlow": false
+    },
+    {
+      "id": "collect-operational-signals",
+      "name": "Collect Operational Signals",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -60,
+        160
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Review ageing and replay candidates. READ-ONLY, both of them.\n--\n-- Ageing changes no review state, ever. \"Nobody has looked at this\" is not a\n-- decision, and a maintenance run that resolved, dismissed or approved an item\n-- because it got old would be making one on a human's behalf.\n--\n-- Replay candidates are reported, not replayed. Replay is the one maintenance\n-- operation that repeats work, so it stays an explicit act.\n--\n-- These are operational ageing labels. They are NOT anomaly severity and are\n-- not comparable with it: a critical anomaly reviewed within the hour is a\n-- healthy pipeline, and a minor one unclaimed for a week is not.\nSELECT\n    (SELECT count(*) FROM salesops.review_ageing)::int                          AS open_reviews,\n    (SELECT count(*) FROM salesops.review_ageing WHERE ageing_bucket = 'warning')::int\n                                                                                AS reviews_warning,\n    (SELECT count(*) FROM salesops.review_ageing WHERE ageing_bucket = 'overdue')::int\n                                                                                AS reviews_overdue,\n    (SELECT count(*) FROM salesops.review_ageing\n      WHERE ageing_bucket = 'critical_overdue')::int                            AS reviews_critical_overdue,\n    (SELECT count(*) FROM salesops.review_ageing WHERE escalation_eligible)::int AS reviews_escalatable,\n    (SELECT count(*) FROM salesops.ingestion_replay_candidates\n      WHERE replay_eligible)::int                                               AS replay_candidates,\n    (SELECT count(*) FROM salesops.stale_notifications)::int                    AS stale_notifications,\n    (SELECT count(*) FROM salesops.operational_retry_queue WHERE retry_eligible)::int\n                                                                                AS retry_eligible,\n    (SELECT count(*) FROM salesops.operational_retry_queue WHERE terminal)::int  AS terminal_failures,\n    0                                                                           AS review_state_changes;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "Branch 3 of 5. Read-only. review_state_changes is hardcoded 0 and asserted by the test suite: ageing must never change a review's state.",
+      "notesInFlow": false
+    },
+    {
+      "id": "staging-retention",
+      "name": "Staging Retention",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        180,
+        160
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Delete settled staging rows past the retention period.\n--\n-- Only 'processed' and 'skipped' rows are ever eligible. 'pending' is\n-- unfinished work; 'failed' is the dead-letter trail, and deleting it would\n-- destroy both the replay source and the record that something went wrong.\n-- Neither is a rule this node has to remember - purge_staging() enforces both,\n-- and a row involved in a replay is protected by a foreign key on top.\n--\n-- Retaining every failed row forever is stricter than a retention policy needs\n-- to be. It is also the only default that cannot lose evidence.\n--\n-- Idempotent: a second run finds nothing left to delete.\nSELECT\n    rows_eligible::int   AS eligible,\n    rows_deleted::int    AS deleted,\n    rows_protected::int  AS protected,\n    retention_days,\n    cutoff\nFROM salesops.purge_staging(FALSE, 'stage10-recovery');",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "Branch 4 of 5. Runs for real (dry_run=FALSE) because the eligibility rules are conservative enough to be safe unattended: pending and failed rows are never eligible, and neither is anything involved in a replay.",
+      "notesInFlow": false
+    },
+    {
+      "id": "retry-stale-notifications",
+      "name": "Retry Stale Notifications",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        420,
+        160
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://analytics-service:8000/operations/maintenance",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ \"actor\": \"stage10-recovery\", \"purge\": false, \"replay\": false, \"retry_notifications\": true }) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "Branch 5 of 5. The only step needing the service: retrying a stale notification means asking Stage 8 to route again for that date, using its own delivery path, idempotency key and attempt accounting. Re-implementing any of that here would create a second delivery path to disagree with the first. NO CREDENTIALS HERE - the webhook URL and recipient list live in the service environment. purge and replay are false: this call is for the notification step, and the SQL branches above own the rest. A notification already 'sent' cannot be touched, because resend is never set.",
+      "notesInFlow": false
+    },
+    {
+      "id": "finalize-maintenance-run",
+      "name": "Finalize Maintenance Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        680,
+        280
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Close the run, deriving the status from what the branches actually did.\n--\n-- 'failed'  every branch failed. Nothing was recovered and nothing was\n--           cleaned up; the pipeline is in exactly the state it was.\n--\n-- 'partial' some branches failed and others did real work. Reported honestly\n--           rather than as success, because a caller reading only the status\n--           has to be able to trust it.\n--\n-- 'success' every branch that ran completed - including the common case where\n--           there was nothing to recover, which is a healthy pipeline rather\n--           than a wasted run.\n--\n-- records_received  = maintenance branches attempted\n-- records_accepted  = branches that completed\n-- records_rejected  = branches that failed\n-- records_duplicate = 0 (a branch has one outcome; there is no third state)\n-- The four balance by construction, satisfying the counts CHECK.\nUPDATE salesops.ingestion_runs r\nSET finished_at       = now(),\n    records_received  = $2::int,\n    records_accepted  = $2::int - $3::int,\n    records_rejected  = $3::int,\n    records_duplicate = 0,\n    status            = CASE\n                            WHEN $3::int >= $2::int THEN 'failed'\n                            WHEN $3::int > 0        THEN 'partial'\n                            ELSE 'success'\n                        END,\n    error_message     = CASE WHEN $3::int > 0\n                             THEN $3::text || ' maintenance branch(es) failed: ' || $4::text\n                        END\nWHERE r.batch_id = $1::uuid\nRETURNING\n    run_id,\n    batch_id::text AS batch_id,\n    status,\n    $2::int        AS branches_attempted,\n    $3::int        AS branches_failed,\n    $5::int        AS stale_runs_recovered,\n    $6::int        AS stale_remediation_recovered,\n    $7::int        AS staging_rows_deleted,\n    -- The state of the world after. Compared against the 'before' snapshot\n    -- taken by the opening node, this is what makes a rerun's idempotency\n    -- readable straight from the ledger.\n    (SELECT count(*) FROM salesops.ingestion_runs\n      WHERE status = 'running'\n        AND started_at < now() - make_interval(mins => salesops.operational_setting('stale_run_timeout_minutes')::int)\n    )::int                                                          AS stale_runs_after,\n    (SELECT count(*) FROM salesops.remediation_actions\n      WHERE status = 'execution_unknown')::int                      AS awaiting_reconciliation,\n    (SELECT count(*) FROM salesops.operational_retry_queue WHERE retry_eligible)::int\n                                                                    AS retry_eligible,\n    (SELECT overall_status FROM salesops.operational_health_summary) AS health_after,\n    (SELECT array_to_string(unhealthy, ', ')\n       FROM salesops.operational_health_summary)                     AS unhealthy_components,\n    round(extract(epoch FROM (finished_at - started_at))::numeric, 2) AS duration_seconds;",
+        "options": {
+          "queryReplacement": "={{ (() => { const names = ['Recover Stale Runs','Recover Stale Remediation','Collect Operational Signals','Staging Retention','Retry Stale Notifications']; const get = n => { try { return $(n).first().json; } catch (e) { return { error: 'node did not run' }; } }; const results = names.map(n => ({ name: n, json: get(n) })); const failed = results.filter(r => r.json && r.json.error); return [ $('Open Maintenance Run').first().json.batch_id, results.length, failed.length, failed.map(f => f.name + ' (' + ((f.json.error && (f.json.error.message || f.json.error.description)) || 'failed') + ')').join('; ').slice(0, 400) || 'none', get('Recover Stale Runs').recovered || 0, get('Recover Stale Remediation').recovered || 0, get('Staging Retention').deleted || 0 ]; })() }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "salesopsPgCred01",
+          "name": "Salesops Analytics DB"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Aggregates all five branches. Status is derived from how many failed, never from having reached this node. Reads each branch defensively - a node that errored still produced an item, and the expression treats a missing result as a failed branch rather than throwing.",
+      "notesInFlow": false
+    }
+  ],
+  "connections": {
+    "Schedule - Daily": {
+      "main": [
+        [
+          {
+            "node": "Open Maintenance Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Run": {
+      "main": [
+        [
+          {
+            "node": "Open Maintenance Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open Maintenance Run": {
+      "main": [
+        [
+          {
+            "node": "Recover Stale Runs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recover Stale Runs": {
+      "main": [
+        [
+          {
+            "node": "Recover Stale Remediation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recover Stale Remediation": {
+      "main": [
+        [
+          {
+            "node": "Collect Operational Signals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Operational Signals": {
+      "main": [
+        [
+          {
+            "node": "Staging Retention",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Staging Retention": {
+      "main": [
+        [
+          {
+            "node": "Retry Stale Notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry Stale Notifications": {
+      "main": [
+        [
+          {
+            "node": "Finalize Maintenance Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "salesopsErrors001",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true
+  },
+  "tags": []
+}
