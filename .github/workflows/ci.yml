@@ -130,32 +130,28 @@ jobs:
 
       # Named explicitly rather than run as a whole suite with skips. A suite
       # that skips what it cannot reach reports green for the wrong reason, and
-      # this project has already been bitten by that once.
+      # this project has already been bitten by that once - so the absence of
+      # skips is asserted here rather than assumed.
+      #
+      # pipefail matters: without it the pipeline's status is tee's, and a
+      # failing test run would be reported as a pass.
       - name: Statistics, detection, prompts, validation and delivery content
         working-directory: analytics-service
+        shell: bash
         run: |
-          python -m pytest -q \
+          set -euo pipefail
+          python -m pytest -q -rs \
             tests/test_statistics.py \
             tests/test_baseline.py \
             tests/test_detector.py \
             tests/test_llm_config.py \
             tests/test_llm_prompt.py \
             tests/test_llm_validation.py \
-            tests/test_notification_content.py
+            tests/test_notification_content.py \
+            2>&1 | tee pytest-offline.log
 
-      - name: No test reached a network or a database
-        working-directory: analytics-service
-        run: |
-          # These suites are pure. If one of them ever grows a live dependency,
-          # it will start skipping in CI instead of failing, so the absence of
-          # skips is asserted rather than assumed.
-          python -m pytest -q -rs \
-            tests/test_statistics.py tests/test_baseline.py tests/test_detector.py \
-            tests/test_llm_config.py tests/test_llm_prompt.py \
-            tests/test_llm_validation.py tests/test_notification_content.py \
-            2>&1 | tee result.txt
-          if grep -qE "skipped|SKIPPED" result.txt; then
-            echo "::error::a supposedly offline test skipped - it has grown a live dependency"
+          if grep -qiE "[0-9]+ skipped" pytest-offline.log; then
+            echo "::error::an offline test skipped - it has grown a live dependency"
             exit 1
           fi
 
