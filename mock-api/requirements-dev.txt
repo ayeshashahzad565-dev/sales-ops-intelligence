@@ -1,0 +1,6 @@
+# Test-only dependencies. Deliberately not installed into the runtime image -
+# the container ships the application, not its test harness.
+-r requirements.txt
+
+pytest>=8.0,<10.0
+httpx>=0.27,<1.0
