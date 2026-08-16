@@ -85,7 +85,11 @@ say "Starting the services"
 # ---------------------------------------------------------------------------
 docker compose up -d --build
 info "waiting for five health checks (Metabase takes 1-3 minutes)..."
-deadline=$(( $(date +%s) + 600 ))
+# Metabase rebuilds its application schema on a fresh volume, and on a host with
+# little memory to spare it can crash once and succeed on the restart, which
+# pushes a first run past ten minutes. The wait is generous so that a slow but
+# recovering start is not reported as a failure.
+deadline=$(( $(date +%s) + 1200 ))
 until [[ "$(docker compose ps --format '{{.Health}}' 2>/dev/null | grep -c healthy)" == "5" ]]; do
     (( $(date +%s) < deadline )) || die "services did not become healthy: $(docker compose ps --format '{{.Service}} {{.Health}}' | tr '\n' ';')"
     sleep 5
@@ -109,6 +113,64 @@ say "Importing n8n workflows"
 ./n8n/import-workflows.sh --activate >/tmp/salesops-import.log 2>&1 \
     || { tail -20 /tmp/salesops-import.log; die "workflow import failed."; }
 ok "10 workflows imported and their schedules activated"
+
+
+# ---------------------------------------------------------------------------
+say "Injecting the demonstration incident"
+# ---------------------------------------------------------------------------
+# The generator emits ordinary business variation and Stage 5 finds some of it,
+# but none of it is severe enough to reach the top of the Stage 6 ladder. The
+# incident the dashboards are built around is therefore injected deliberately -
+# by rewriting real order rows, never by setting a flag, so detection still has
+# to rediscover it.
+#
+# V008 grades 'critical' only on a severe revenue impact combined with at least
+# one severe operational signal, so this is two injections on one date: a price
+# collapse and a refund spike.
+#
+# The date is relative because the order book anchors its 90-day window to today
+# unless MOCK_API_HISTORY_END_DATE pins it. A literal would drift out of the
+# window. provision.sh reads this same value for the investigation dashboard's
+# default, so the panel and the data always agree.
+#
+# Resolved once and then written to .env, because "ten days ago" is a different
+# day tomorrow. The order book keeps the incident where it was injected, so a
+# recomputed date would drift off it overnight and every consumer - the
+# dashboard default, the test fixtures - would point at an ordinary Tuesday.
+INCIDENT_DATE="${SALESOPS_INCIDENT_DATE:-}"
+if [[ -z "$INCIDENT_DATE" ]]; then
+    INCIDENT_DATE="$(grep -E '^SALESOPS_INCIDENT_DATE=' .env 2>/dev/null | cut -d= -f2- | tr -d '\r' || true)"
+fi
+if [[ -z "$INCIDENT_DATE" ]]; then
+    INCIDENT_DATE="$(date -d '10 days ago' +%F 2>/dev/null || date -v-10d +%F)"
+fi
+export SALESOPS_INCIDENT_DATE="$INCIDENT_DATE"
+mock_api="http://localhost:${MOCK_API_HOST_PORT:-8000}"
+
+# Injections compound - applying the same one twice stacks the effect - so a
+# second bootstrap run must not deepen the incident it already created.
+if curl -sf "${mock_api}/admin/anomalies" | grep -q "\"${INCIDENT_DATE}\""; then
+    info "already present for ${INCIDENT_DATE}; injections compound, so skipping"
+else
+    inject_anomaly() {
+        curl -sf -X POST "${mock_api}/admin/inject-anomaly" \
+            -H 'Content-Type: application/json' \
+            -d "{\"type\":\"$1\",\"date\":\"${INCIDENT_DATE}\",\"severity\":$2}" >/dev/null
+    }
+    inject_anomaly revenue_drop 0.55 || die "could not inject the revenue drop"
+    inject_anomaly refund_spike 0.60 || die "could not inject the refund spike"
+fi
+
+# Persisted so that provision.sh, the Stage 11 fixtures and a bootstrap run
+# tomorrow all name the same day.
+if grep -qE '^SALESOPS_INCIDENT_DATE=' .env 2>/dev/null; then
+    sed -i.bak "s|^SALESOPS_INCIDENT_DATE=.*|SALESOPS_INCIDENT_DATE=${INCIDENT_DATE}|" .env
+    rm -f .env.bak
+else
+    printf '\n# The date bootstrap.sh injected the demonstration incident into.\n# Written here so it survives the calendar; delete it to pick a new day.\nSALESOPS_INCIDENT_DATE=%s\n' \
+        "$INCIDENT_DATE" >> .env
+fi
+ok "critical incident staged for ${INCIDENT_DATE}"
 
 
 # ---------------------------------------------------------------------------
@@ -142,10 +204,101 @@ else
     run_workflow salesopsDetect001 "anomaly detection"
     run_workflow salesopsDecide01  "anomaly decision"
     run_workflow salesopsLlmRca01  "LLM root cause"
+
+    # Stage 7 works through candidates in date order, and free LLM tiers meter
+    # tokens per minute rather than per day - a 90-day backlog can exhaust the
+    # quota before it reaches the incident this demo is built around. Ask for
+    # that one by name. It is a no-op when the scheduled run already covered it,
+    # and it runs before Stage 8 because the review queue snapshots whether a
+    # hypothesis existed at the moment it queued the review.
+    printf '      %-26s' "incident hypothesis"
+    if curl -sf -X POST "http://localhost:${ANALYTICS_API_HOST_PORT:-8001}/anomalies/analyze" \
+           -H 'Content-Type: application/json' \
+           -d "{\"decision_version\":\"stage6-v1\",\"regenerate\":false,\"dates\":[\"${INCIDENT_DATE}\"]}" \
+           --max-time 300 >>/tmp/salesops-pipeline.log 2>&1; then
+        printf '%s✓%s\n' "$green" "$reset"
+    else
+        # No key, no quota, or no model. Stage 6 has already decided and Stage 8
+        # will still escalate; the incident simply arrives without a hypothesis.
+        printf '%s- no hypothesis for %s%s\n' "$dim" "$INCIDENT_DATE" "$reset"
+    fi
+
+    # The same quota problem reaches the notified anomalies. A notification
+    # carries a hypothesis only if one exists by the time Stage 8 runs, and the
+    # minor days are last in date order, so on a free tier they never get one.
+    # Asked for by name here for the same reason as the incident above.
+    minor_pending="$(docker compose exec -T postgres psql -U "${POSTGRES_USER:-salesops}" \
+        -d "${POSTGRES_DB:-salesops}" -qtA -c "
+        SELECT d.calendar_date FROM salesops.anomaly_decisions d
+        LEFT JOIN salesops.anomaly_hypotheses h USING (anomaly_id)
+        WHERE d.is_anomaly AND d.severity = 'minor' AND d.routing = 'auto_notify'
+          AND h.hypothesis_id IS NULL
+        ORDER BY d.anomaly_score DESC LIMIT 1;" 2>/dev/null | tr -d '\r' || true)"
+    if [[ -n "$minor_pending" ]]; then
+        printf '      %-26s' "notified hypothesis"
+        if curl -sf -X POST "http://localhost:${ANALYTICS_API_HOST_PORT:-8001}/anomalies/analyze" \
+               -H 'Content-Type: application/json' \
+               -d "{\"decision_version\":\"stage6-v1\",\"regenerate\":false,\"dates\":[\"${minor_pending}\"]}" \
+               --max-time 300 >>/tmp/salesops-pipeline.log 2>&1; then
+            printf '%s✓%s\n' "$green" "$reset"
+        else
+            printf '%s- none for %s%s\n' "$dim" "$minor_pending" "$reset"
+        fi
+    fi
+
     run_workflow salesopsNotify01  "notification and review"
     run_workflow salesopsRemed01   "remediation execution"
     run_workflow salesopsMaint01   "operational maintenance"
     ok "pipeline executed in dependency order"
+
+    # The critical incident is injected, so its date is chosen. The other three
+    # are not: which ordinary days rise to major, which fall to minor, and which
+    # stay unremarkable are all properties of the generated series. The
+    # warehouse-backed suites need one of each to assert against, and literals
+    # would be wrong the first time anyone rebuilt the volumes - so they are read
+    # back here and recorded beside the injected date.
+    read_back() {
+        docker compose exec -T postgres psql -U "${POSTGRES_USER:-salesops}" \
+            -d "${POSTGRES_DB:-salesops}" -qtA -c "$1" 2>/dev/null | tr -d '\r' || true
+    }
+    record() {
+        local key="$1" value="$2" note="$3"
+        [[ -n "$value" ]] || return 0
+        if grep -qE "^${key}=" .env 2>/dev/null; then
+            sed -i.bak "s|^${key}=.*|${key}=${value}|" .env && rm -f .env.bak
+        else
+            printf '\n# %s\n%s=%s\n' "$note" "$key" "$value" >> .env
+        fi
+        printf '      %-26s %s\n' "${key#SALESOPS_}" "$value"
+    }
+
+    record SALESOPS_MAJOR_DATE "$(read_back "
+        SELECT calendar_date FROM salesops.anomaly_decisions
+        WHERE is_anomaly AND severity = 'major'
+          AND decision_reason_code = 'HIGH_REVENUE_IMPACT'
+        ORDER BY anomaly_score DESC, calendar_date LIMIT 1;")" \
+        "The highest-scoring day graded major - a rung below the injected critical."
+
+    record SALESOPS_MINOR_DATE "$(read_back "
+        SELECT calendar_date FROM salesops.anomaly_decisions
+        WHERE is_anomaly AND severity = 'minor' AND routing = 'auto_notify'
+        ORDER BY anomaly_score DESC, calendar_date LIMIT 1;")" \
+        "A real anomaly too small to be worth a person - the only kind that is notified."
+
+    # The control day, and every clause here is load-bearing. A Sunday, because
+    # the baseline is per weekday and "normal" has to be normal against the
+    # right comparison set. Not an anomaly, obviously. Scored against a
+    # day-of-week baseline rather than a fallback. And ABOVE its own weekday
+    # median while sitting well under the trailing seven-day mean - which is the
+    # whole argument for calendar awareness: a blind moving average calls this
+    # day a collapse, and the detector correctly does not.
+    record SALESOPS_NORMAL_DATE "$(read_back "
+        SELECT calendar_date FROM salesops.anomaly_daily
+        WHERE NOT is_anomaly AND baseline_kind = 'day_of_week'
+          AND EXTRACT(DOW FROM calendar_date) = 0
+          AND revenue_deviation_pct > 0
+        ORDER BY calendar_date DESC LIMIT 1;")" \
+        "An ordinary Sunday: under the trailing mean, above its own weekday median."
 fi
 
 
@@ -209,7 +362,7 @@ cat <<EOF
     curl -s -X POST http://localhost:8001/remediation/<id>/execute \\
       -H 'Content-Type: application/json' -d '{"actor":"someone.else@example.com"}'
 
-  Then open ${bold}Anomaly Investigation${reset}. It defaults to 2026-08-05 and now traces
+  Then open ${bold}Anomaly Investigation${reset}. It defaults to ${bold}${INCIDENT_DATE}${reset} and now traces
   that incident from the orders through to the action you authorised - with both
   names on it, and the language model's contribution clearly marked as the only
   unverified line in the chain.

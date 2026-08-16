@@ -35,6 +35,16 @@ readonly_password="$(grep -E '^METABASE_READONLY_DB_PASSWORD=' .env | cut -d= -f
 db_user="$(grep -E '^POSTGRES_USER=' .env | cut -d= -f2- || echo salesops)"
 db_name="$(grep -E '^POSTGRES_DB=' .env | cut -d= -f2- || echo salesops)"
 
+# The investigation dashboard's default date. bootstrap.sh writes it here after
+# injecting the incident; an inherited value from the caller wins, so a run
+# inside bootstrap does not depend on the file having been written yet. Left
+# unset, the catalogue falls back to its own offset from today - correct on the
+# day the incident was injected and wrong the morning after, which is precisely
+# why it is persisted rather than recomputed.
+if [[ -z "${SALESOPS_INCIDENT_DATE:-}" ]]; then
+    export SALESOPS_INCIDENT_DATE="$(grep -E '^SALESOPS_INCIDENT_DATE=' .env | cut -d= -f2- | tr -d '\r' || true)"
+fi
+
 if [[ -z "$readonly_password" ]]; then
     echo "METABASE_READONLY_DB_PASSWORD is not set in .env." >&2
     echo "Generate one:  python -c \"import secrets;print(secrets.token_urlsafe(24))\"" >&2

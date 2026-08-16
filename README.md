@@ -17,8 +17,9 @@ own finding, and nothing executes that a person did not authorise by name.
 git clone <repo-url> && cd sales-ops-intelligence && ./bootstrap.sh
 ```
 
-Five minutes from clone to four live dashboards over 90 days of orders, eleven
-detected anomalies, and a review queue waiting on a human.
+Five minutes from clone to four live dashboards over 90 days of orders, a
+deliberately injected critical incident traced end to end, and a review queue
+waiting on a human.
 
 | | |
 |---|---|
@@ -105,24 +106,29 @@ Full narrative: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## One incident, end to end
 
-The injected anomaly on **2026-08-05** runs the whole length of the platform.
-The investigation dashboard shows it as ten steps:
+`bootstrap.sh` injects one incident — a price collapse and a refund spike on the
+same day — and it runs the whole length of the platform. The investigation
+dashboard shows it as ten steps:
 
 ```
- 1 orders               52 orders, 136 units                       observed fact
- 2 kpi                  net revenue 4,748.95 USD, AOV 91.33 USD    observed fact
- 3 anomaly              score 8.925, dominant refund, 3 signals    statistical
+ 1 orders               58 orders, 111 units                       observed fact
+ 2 kpi                  net revenue 2,243.43 USD, AOV 38.68 USD    observed fact
+ 3 anomaly              score 14.478, dominant revenue, 3 signals  statistical
  4 decision             critical / human_review /                  deterministic
                         CRITICAL_COMBINED_IMPACT
  5 hypothesis           unverified, stated confidence medium       ▲ LLM
  6 notification         not notified (routing = human_review)      not reached
  7 review               approved              — dana@finance       human review
  8 remediation          request_refund_review — priya@revops       approved
- 9 execution            executed, reference local-record-3         completed
+ 9 execution            executed, reference local-record-1         completed
 10 operational outcome  0 events recorded against this action      operational
 ```
 
 Step 5 is the only line a language model wrote, and step 4 happened before it.
+
+The figures above are from one run. The order generator anchors its ninety days
+to today, so your dates and totals will differ — `bootstrap.sh` records the day
+it injected into as `SALESOPS_INCIDENT_DATE`, and the dashboard defaults to it.
 
 ---
 

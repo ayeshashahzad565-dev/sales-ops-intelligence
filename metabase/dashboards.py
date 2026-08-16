@@ -22,6 +22,10 @@ in grid units.
 
 from __future__ import annotations
 
+import os
+from datetime import date, timedelta
+from pathlib import Path
+
 # ---------------------------------------------------------------------------
 # The columns that are model output. Named once, here, so the rule that keeps
 # them off the executive dashboard has exactly one definition.
@@ -48,7 +52,38 @@ DATABASE_NAME = "Sales Ops Analytics (read-only)"
 # re-provisioning updates the same parameter instead of adding a second one.
 INCIDENT_DATE_PARAM_ID = "a1b2c3d4"
 INCIDENT_DATE_TAG_ID = "0f2c9a11-0000-4000-8000-00000000d001"
-DEFAULT_INCIDENT_DATE = "2026-08-05"
+
+# The order generator anchors its 90-day window to today unless
+# MOCK_API_HISTORY_END_DATE pins it, so the incident bootstrap.sh injects lands
+# on a different calendar date every day. A literal here would drift away from
+# the data within a day of being written, and the panel would default to a date
+# with nothing on it.
+#
+# bootstrap.sh resolves the date once, injects into it and records it in .env.
+# That file is read here rather than only the environment, because provisioning
+# is meant to be re-runnable on its own - and a dashboard rebuilt on Tuesday
+# must still point at Monday's incident.
+INCIDENT_DATE_OFFSET_DAYS = 10
+
+
+def _recorded_incident_date() -> str | None:
+    """The injected date, from the environment or from .env. None if neither."""
+    from_env = os.environ.get("SALESOPS_INCIDENT_DATE", "").strip()
+    if from_env:
+        return from_env
+    env_file = Path(__file__).resolve().parent.parent / ".env"
+    if not env_file.exists():
+        return None
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "SALESOPS_INCIDENT_DATE":
+            return value.strip() or None
+    return None
+
+
+DEFAULT_INCIDENT_DATE = _recorded_incident_date() or (
+    date.today() - timedelta(days=INCIDENT_DATE_OFFSET_DAYS)
+).isoformat()
 
 _INCIDENT_DATE_TAG = {
     "incident_date": {
@@ -752,7 +787,7 @@ DASHBOARDS = [
         "name": "Anomaly Investigation",
         "description": (
             "One anomaly, layer by layer, in the order it must be read. Defaults to "
-            "the 2026-08-05 incident."
+            "the incident bootstrap.sh injected; change the date filter for any other."
         ),
         "parameters": [
             {
