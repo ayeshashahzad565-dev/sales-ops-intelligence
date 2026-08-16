@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-from datetime import date
 
 import pytest
 
@@ -24,13 +23,14 @@ from analytics.config import Settings
 from analytics.notifications import service
 from analytics.notifications.models import DeliveryOutcome
 from analytics.notifications.provider import RecordingProvider
+from tests.live_dates import INCIDENT_DATE as LIVE_CRITICAL
+from tests.live_dates import MAJOR_DATE as LIVE_MAJOR
+from tests.live_dates import MINOR_DATE as LIVE_MINOR
+from tests.live_dates import NORMAL_DATE as LIVE_NORMAL
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
-LIVE_CRITICAL = date(2026, 8, 5)     # critical / human_review
-LIVE_MAJOR = date(2026, 8, 9)        # major / human_review
-LIVE_MINOR = date(2026, 6, 1)        # minor / auto_notify
-LIVE_NORMAL = date(2026, 8, 2)       # none / no_action
+
 
 TEST_RECIPIENT = "stage8-tests@example.invalid"
 OTHER_RECIPIENT = "stage8-tests-second@example.invalid"

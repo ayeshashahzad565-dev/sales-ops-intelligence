@@ -24,12 +24,13 @@ from analytics.notifications import service as notification_service
 from analytics.notifications.provider import RecordingProvider
 from analytics.remediation import service as remediation_service
 from analytics.remediation.models import ActionType
+from tests.live_dates import INCIDENT_DATE as LIVE_CRITICAL
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
-#: The live anomalies the whole project is validated against.
-LIVE_CRITICAL = date(2026, 8, 5)
-LIVE_MAJOR = date(2026, 8, 9)
+#: The live anomalies the whole project is validated against. Recorded by
+#: bootstrap.sh rather than written here - see tests/live_dates.py for why a
+#: literal cannot survive a `docker compose down -v`.
 
 #: Never a real address, and never one that could reach anybody: .invalid is
 #: reserved by RFC 2606 precisely so it cannot resolve.

@@ -33,10 +33,10 @@ from analytics.notifications import service as notification_service
 from analytics.remediation import service
 from analytics.remediation.models import ActionType, ExecutionOutcome
 from analytics.remediation.provider import RecordingRemediationProvider
+from tests.live_dates import INCIDENT_DATE as LIVE_CRITICAL
+from tests.live_dates import MAJOR_DATE as LIVE_MAJOR
 from tests.remediation_fixtures import (
     APPROVER,
-    LIVE_CRITICAL,
-    LIVE_MAJOR,
     REPO_ROOT,
     action_row,
     approve,

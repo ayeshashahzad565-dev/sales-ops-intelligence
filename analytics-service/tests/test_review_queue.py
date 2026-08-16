@@ -26,11 +26,11 @@ from analytics import repository
 from analytics.config import Settings
 from analytics.notifications import service
 from analytics.notifications.provider import RecordingProvider
+from tests.live_dates import INCIDENT_DATE as LIVE_CRITICAL
+from tests.live_dates import MAJOR_DATE as LIVE_MAJOR
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
-LIVE_CRITICAL = date(2026, 8, 5)
-LIVE_MAJOR = date(2026, 8, 9)
 
 TEST_RECIPIENT = "stage8-review-tests@example.invalid"
 

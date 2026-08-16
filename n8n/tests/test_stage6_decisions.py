@@ -651,18 +651,41 @@ BEGIN
         d.decision_reason_code = 'NORMAL_VARIATION', d.decision_reason_code);
 
     -- The claim that critical is not "the biggest number", checked against the
-    -- real series rather than a fixture: the highest-scoring live day must not
-    -- be the critical one.
+    -- real series rather than a fixture.
+    --
+    -- This used to assert that the top-scoring day was not the critical one,
+    -- which was true only while the loudest statistical day happened to be a
+    -- low-impact one. Inject a genuine incident - a price collapse and a refund
+    -- spike on one day - and the top scorer becomes legitimately critical, so
+    -- the check failed and reported a Stage 6 regression where there was none.
+    --
+    -- What has to be true is the stronger, order-free statement: severity is
+    -- not a function of the score. If somewhere in the series a louder day is
+    -- graded LESS severe than a quieter one, then something other than the
+    -- score decided it - which is the whole point of the business-impact tier.
     SELECT calendar_date, severity, anomaly_score INTO top_score
     FROM salesops.anomaly_decisions
     WHERE decision_version = 'stage6-v1' AND is_anomaly
       AND calendar_date >= DATE '2026-01-01'
     ORDER BY anomaly_score DESC LIMIT 1;
 
-    PERFORM pg_temp.check('live', 'the highest-scoring live day is not automatically critical',
-        top_score.severity <> 'critical',
-        format('%s scored %s -> %s', top_score.calendar_date, top_score.anomaly_score,
-               top_score.severity));
+    PERFORM pg_temp.check('live', 'severity does not simply follow the anomaly score',
+        EXISTS (
+            SELECT 1
+            FROM salesops.anomaly_decisions louder
+            JOIN salesops.anomaly_decisions quieter
+              ON quieter.decision_version = 'stage6-v1'
+             AND quieter.is_anomaly
+             AND quieter.anomaly_score < louder.anomaly_score
+            WHERE louder.decision_version = 'stage6-v1'
+              AND louder.is_anomaly
+              AND array_position(ARRAY['none','minor','major','critical'],
+                                 louder.severity::text)
+                < array_position(ARRAY['none','minor','major','critical'],
+                                 quieter.severity::text)
+        ),
+        format('top score %s on %s graded %s', top_score.anomaly_score,
+               top_score.calendar_date, top_score.severity));
 
     -- Nothing unscorable anywhere in the live set may be actionable.
     PERFORM pg_temp.check('live', 'no unscorable date is actionable',

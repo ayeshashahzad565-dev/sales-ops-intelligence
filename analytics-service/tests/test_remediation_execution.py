@@ -19,11 +19,11 @@ from analytics import repository
 from analytics.remediation import service
 from analytics.remediation.models import ActionType, ExecutionOutcome
 from analytics.remediation.provider import RecordingRemediationProvider
+from tests.live_dates import INCIDENT_DATE as LIVE_CRITICAL
+from tests.live_dates import MAJOR_DATE as LIVE_MAJOR
 from tests.remediation_fixtures import (
     APPROVER,
     AUTHORIZER,
-    LIVE_CRITICAL,
-    LIVE_MAJOR,
     action_row,
     approve,
     authorized_action,

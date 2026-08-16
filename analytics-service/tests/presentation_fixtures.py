@@ -19,7 +19,7 @@ Stage 11 itself writes nothing, so there is no teardown here - a presentation
 layer that needed cleaning up after would not be a presentation layer.
 
 There is one fixture that writes, and it is worth understanding why.
-`ensure_critical_incident` rebuilds the 2026-08-05 chain when an earlier suite
+`ensure_critical_incident` rebuilds the injected incident's chain when an earlier suite
 has purged the review queue, because the alternative is to skip - and skipping
 would turn a dozen assertions about an end-to-end chain into a dozen silent
 passes. It builds the chain by calling the real Stage 8 and Stage 9 entry
@@ -29,7 +29,9 @@ points, so every guard still runs and every transition is still attributed.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
+from datetime import date, timedelta
 
 import pytest
 
@@ -38,7 +40,7 @@ from tests.operations_fixtures import REPO_ROOT, load_env_file, make_settings, q
 
 __all__ = [
     "CRITICAL_DATE",
-    "MAJOR_DATE",
+    "major_date",
     "REPO_ROOT",
     "REVIEWER",
     "AUTHORISER",
@@ -51,11 +53,59 @@ __all__ = [
     "sql_statements",
 ]
 
-#: The injected incident, and the one that must stay one rung below it. Both are
-#: asserted by date rather than by "the worst anomaly", so a change that
-#: reclassified either would fail here instead of quietly re-pointing the test.
-CRITICAL_DATE = "2026-08-05"
-MAJOR_DATE = "2026-08-09"
+#: The injected incident. bootstrap.sh computes this date, injects a revenue
+#: collapse and a refund spike into it, and exports it; the dashboard catalogue
+#: reads the same variable for its default. A literal would be wrong the day
+#: after it was written, because the order generator anchors its 90-day window
+#: to today unless MOCK_API_HISTORY_END_DATE pins it.
+INCIDENT_OFFSET_DAYS = 10
+
+
+def _incident_date() -> str:
+    """The day bootstrap.sh injected the incident into.
+
+    Environment first, then .env - which is where bootstrap.sh records it, and
+    the reason it records it at all: the offset below is only correct on the day
+    the injection happened. Recomputing it tomorrow would point these tests at
+    an ordinary day and fail with "not critical", which reads as a Stage 6
+    regression rather than as a stale fixture.
+    """
+    from_env = os.environ.get("SALESOPS_INCIDENT_DATE", "").strip()
+    if from_env:
+        return from_env
+    from_file = load_env_file().get("SALESOPS_INCIDENT_DATE", "").strip()
+    if from_file:
+        return from_file
+    return (date.today() - timedelta(days=INCIDENT_OFFSET_DAYS)).isoformat()
+
+
+CRITICAL_DATE = _incident_date()
+
+
+def major_date(connection):
+    """The date of the most severe `major` anomaly, discovered rather than named.
+
+    The critical incident is injected, so its date is known. The majors are not:
+    they are whatever ordinary variation the generator produced, and which dates
+    qualify changes with the window. Pinning one would assert a property of last
+    week's random numbers.
+
+    What the tests actually need is a rung below critical to compare against, so
+    that is what this finds - and it fails loudly rather than skipping, because
+    a run with no major anomaly at all means Stage 6 stopped grading.
+    """
+    rows = query(connection, """
+        SELECT calendar_date FROM salesops.anomaly_decisions
+        WHERE is_anomaly AND severity = 'major'
+        ORDER BY anomaly_score DESC, calendar_date LIMIT 1
+    """)
+    if not rows:
+        pytest.fail(
+            "No 'major' anomaly exists, so there is nothing one rung below the "
+            "injected critical to compare against. Run ./bootstrap.sh."
+        )
+    return str(rows[0]["calendar_date"])
+
 
 METABASE_DIR = REPO_ROOT / "metabase"
 
@@ -108,7 +158,7 @@ AUTHORISER = "priya@revops"
 
 
 def ensure_critical_incident(settings, connection) -> int:
-    """Drive 2026-08-05 from review to executed, if it is not there already.
+    """Drive the injected incident from review to executed, if not already.
 
     Stage 11's assertions are about a complete chain, and the earlier suites
     legitimately empty the review queue and the action table on teardown. Making

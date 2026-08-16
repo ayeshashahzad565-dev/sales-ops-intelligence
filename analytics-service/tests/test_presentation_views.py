@@ -4,10 +4,11 @@ These are integration tests by necessity. A presentation layer's whole job is to
 report what is actually stored, so a test that mocked the warehouse would be
 testing the mock's opinion of the pipeline rather than the pipeline.
 
-The two anomalies asserted here are the ones the project was built around: the
-injected collapse on 2026-08-05 (critical), and 2026-08-09 (major). Both are
-named by date. Asserting "the worst anomaly is critical" would keep passing if a
-change silently moved which day that was.
+Two anomalies are asserted here. The critical one is the collapse bootstrap.sh
+injects, and it is named by date - asserting "the worst anomaly is critical"
+would keep passing if a change silently moved which day that was. The major one
+is discovered, because which ordinary days qualify is a property of the
+generator's window rather than of the pipeline.
 """
 
 from __future__ import annotations
@@ -17,9 +18,9 @@ import pytest
 from analytics import repository
 from tests.presentation_fixtures import (
     CRITICAL_DATE,
-    MAJOR_DATE,
     dashboards_module,
     ensure_critical_incident,
+    major_date,
     make_settings,
     query,
 )
@@ -203,13 +204,16 @@ def test_the_injected_incident_is_still_critical(connection):
 
 
 def test_the_major_anomaly_is_still_major(connection):
+    """A major is routed to a human too, but is not the injected critical."""
+    major = major_date(connection)
     row = query(connection, """
         SELECT decision_severity, decision_routing
         FROM salesops.anomaly_investigation WHERE calendar_date = %(d)s
-    """, {"d": MAJOR_DATE})
-    assert len(row) == 1, f"no investigation row for {MAJOR_DATE}"
+    """, {"d": major})
+    assert len(row) == 1, f"no investigation row for {major}"
     assert row[0]["decision_severity"] == "major"
     assert row[0]["decision_routing"] == "human_review"
+    assert major != CRITICAL_DATE
 
 
 def test_the_incident_reads_in_layer_order(connection):
@@ -366,14 +370,44 @@ def test_only_reviews_carry_an_ageing_bucket(connection):
 # =============================================================================
 # Audit
 # =============================================================================
-def test_all_six_audit_streams_are_present(connection):
-    rows = query(connection, """
-        SELECT DISTINCT stream FROM salesops.audit_event_stream
-    """)
-    assert {r["stream"] for r in rows} == {
-        "decision", "hypothesis", "notification", "review", "remediation",
-        "operational",
-    }
+#: Every stream the unified audit view is meant to carry. Five of them have rows
+#: on any warehouse the pipeline has run against. The sixth does not: an
+#: operational event is only ever written when something went wrong - a run
+#: abandoned mid-flight, an execution stranded, a batch replayed - so an empty
+#: operational log is what a healthy warehouse looks like.
+AUDIT_STREAMS = frozenset({
+    "decision", "hypothesis", "notification", "review", "remediation",
+    "operational",
+})
+ALWAYS_POPULATED_STREAMS = AUDIT_STREAMS - {"operational"}
+
+
+def test_the_audit_view_carries_all_six_streams(connection):
+    """Asserted against the view's definition, not its current contents.
+
+    Requiring a row in every stream would make this pass only on a warehouse
+    that had already suffered an incident, and the obvious way to satisfy it -
+    manufacturing an operational event - is not available: the log is
+    append-only by design, so a fixture could create the row and never remove
+    it, and it would then show up on the operational dashboard as an incident
+    that never happened.
+    """
+    definition = query(connection, """
+        SELECT pg_get_viewdef('salesops.audit_event_stream'::regclass) AS sql
+    """)[0]["sql"]
+    missing = [s for s in AUDIT_STREAMS if f"'{s}'" not in definition]
+    assert not missing, f"audit_event_stream has no branch for: {missing}"
+
+
+def test_every_audit_row_belongs_to_a_known_stream(connection):
+    """The other half: nothing appears that the view was not built to carry."""
+    rows = query(connection, "SELECT DISTINCT stream FROM salesops.audit_event_stream")
+    present = {r["stream"] for r in rows}
+    assert present <= AUDIT_STREAMS, f"unknown stream(s): {present - AUDIT_STREAMS}"
+    assert present >= ALWAYS_POPULATED_STREAMS, (
+        f"the pipeline has run, so these should have history: "
+        f"{ALWAYS_POPULATED_STREAMS - present}"
+    )
 
 
 def test_every_audit_row_has_an_actor_and_a_time(connection):

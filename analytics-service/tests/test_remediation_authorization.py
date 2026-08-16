@@ -25,10 +25,10 @@ from analytics import repository
 from analytics.notifications import service as notification_service
 from analytics.remediation import service
 from analytics.remediation.models import ActionType
+from tests.live_dates import INCIDENT_DATE as LIVE_CRITICAL
+from tests.live_dates import MAJOR_DATE as LIVE_MAJOR
 from tests.remediation_fixtures import (
     APPROVER,
-    LIVE_CRITICAL,
-    LIVE_MAJOR,
     action_row,
     approve,
     claim,

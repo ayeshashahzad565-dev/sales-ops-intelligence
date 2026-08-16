@@ -25,10 +25,10 @@ from analytics import repository
 from tests.operations_fixtures import all_fingerprints
 from tests.presentation_fixtures import (
     CRITICAL_DATE,
-    MAJOR_DATE,
     REPO_ROOT,
     dashboards_module,
     ensure_critical_incident,
+    major_date,
     make_settings,
     query,
     readonly_settings,
@@ -216,17 +216,18 @@ def test_running_every_dashboard_query_changes_no_state(owner_connection,
 
 
 def test_the_stage_six_decisions_are_untouched(owner_connection):
+    major = major_date(owner_connection)
     rows = query(owner_connection, """
         SELECT calendar_date, severity, routing, decision, decision_reason_code
         FROM salesops.anomaly_decisions
         WHERE calendar_date IN (%(critical)s, %(major)s)
         ORDER BY calendar_date
-    """, {"critical": CRITICAL_DATE, "major": MAJOR_DATE})
+    """, {"critical": CRITICAL_DATE, "major": major})
     by_date = {str(r["calendar_date"]): r for r in rows}
     assert by_date[CRITICAL_DATE]["severity"] == "critical"
     assert by_date[CRITICAL_DATE]["decision_reason_code"] == "CRITICAL_COMBINED_IMPACT"
-    assert by_date[MAJOR_DATE]["severity"] == "major"
-    assert by_date[MAJOR_DATE]["decision_reason_code"] == "HIGH_REVENUE_IMPACT"
+    assert by_date[major]["severity"] == "major"
+    assert by_date[major]["decision_reason_code"] == "HIGH_REVENUE_IMPACT"
 
 
 def test_stage_seven_has_no_write_path_to_stage_six(owner_connection):
@@ -318,9 +319,45 @@ def test_the_audit_history_is_still_complete(owner_connection):
 
 
 def test_the_operational_log_still_refuses_to_be_rewritten(owner_connection):
-    """Stage 10's append-only trigger, re-checked because Stage 11 exposes the
-    log to a wider audience than Stage 10 did."""
-    with pytest.raises(Exception) as excinfo:
+    """Stage 10's append-only guard, re-checked because Stage 11 exposes the log
+    to a wider audience than Stage 10 did.
+
+    Structural rather than behavioural, and deliberately so. A row trigger
+    cannot fire on an `UPDATE` that matches nothing, so the behavioural version
+    of this test passed only on a warehouse that had already recorded an
+    operational event - and it reported "did not raise", which reads as a
+    missing guard rather than as an empty table. Manufacturing a row to attack
+    is not an option either: the log is append-only, so the fixture could create
+    it and never clean it up.
+
+    So the guard is asserted where it actually lives, and the refusal is
+    exercised against whatever history the warehouse genuinely has.
+    """
+    triggers = query(owner_connection, """
+        SELECT pg_get_triggerdef(t.oid) AS definition
+        FROM pg_trigger t
+        JOIN pg_class c ON c.oid = t.tgrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'salesops'
+          AND c.relname = 'operational_events'
+          AND NOT t.tgisinternal
+    """)
+    assert triggers, "operational_events has no trigger guarding it at all"
+    guard = " ".join(t["definition"].upper() for t in triggers)
+    assert "UPDATE" in guard, "nothing stops an operational event being rewritten"
+    assert "DELETE" in guard, "nothing stops an operational event being erased"
+
+    recorded = query(owner_connection, """
+        SELECT count(*) AS n FROM salesops.operational_events
+    """)[0]["n"]
+    if not recorded:
+        return
+
+    # The guard raises with an integrity-constraint SQLSTATE rather than the
+    # bare P0001 a plain RAISE would give, so the specific class matters: it is
+    # the difference between "the trigger refused this" and "some function
+    # somewhere raised".
+    with pytest.raises(psycopg.errors.IntegrityConstraintViolation) as excinfo:
         with owner_connection.cursor() as cursor:
             cursor.execute("""
                 UPDATE salesops.operational_events SET actor = 'rewritten'

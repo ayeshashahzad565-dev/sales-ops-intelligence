@@ -17,7 +17,6 @@ from __future__ import annotations
 import os
 import pathlib
 import re
-from datetime import date
 
 import pytest
 
@@ -25,15 +24,16 @@ from analytics import repository
 from analytics.config import Settings
 from analytics.detector import ANOMALY_SCORE_THRESHOLD, DETECTOR_VERSION
 from analytics.runner import RunMode, run_detection
+from tests.live_dates import INCIDENT_DATE, NORMAL_DATE
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
-# The reference case the Stage 5 specification requires be detected: a day with
-# an injected revenue drop plus a refund spike.
-REFERENCE_ANOMALY = date(2026, 8, 5)
+# The reference case the Stage 5 specification requires be detected: the day
+# bootstrap.sh injects a revenue drop and a refund spike into.
+REFERENCE_ANOMALY = INCIDENT_DATE
 # The reference case that must NOT be flagged: an ordinary Sunday that looks
 # alarming against a blind moving average.
-REFERENCE_NORMAL_SUNDAY = date(2026, 8, 2)
+REFERENCE_NORMAL_SUNDAY = NORMAL_DATE
 
 
 def _load_env_file() -> dict[str, str]:
@@ -189,7 +189,7 @@ def test_the_database_rejects_an_unscored_anomaly(connection) -> None:
                     INSERT INTO salesops.anomaly_daily
                         (calendar_date, detector_version, baseline_status, is_anomaly)
                     VALUES (%(d)s, 'v9.9.9', 'insufficient_history', TRUE)
-                """, {"d": date(2026, 8, 5)})
+                """, {"d": REFERENCE_ANOMALY})
         transaction.force_rollback = True
 
 
@@ -203,7 +203,7 @@ def test_the_database_rejects_a_malformed_detector_version(connection) -> None:
                     INSERT INTO salesops.anomaly_daily
                         (calendar_date, detector_version, baseline_status)
                     VALUES (%(d)s, 'not-a-version', 'insufficient_history')
-                """, {"d": date(2026, 8, 5)})
+                """, {"d": REFERENCE_ANOMALY})
         transaction.force_rollback = True
 
 
