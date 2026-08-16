@@ -211,22 +211,46 @@ else
     # that one by name. It is a no-op when the scheduled run already covered it,
     # and it runs before Stage 8 because the review queue snapshots whether a
     # hypothesis existed at the moment it queued the review.
-    printf '      %-26s' "incident hypothesis"
-    if curl -sf -X POST "http://localhost:${ANALYTICS_API_HOST_PORT:-8001}/anomalies/analyze" \
-           -H 'Content-Type: application/json' \
-           -d "{\"decision_version\":\"stage6-v1\",\"regenerate\":false,\"dates\":[\"${INCIDENT_DATE}\"]}" \
-           --max-time 300 >>/tmp/salesops-pipeline.log 2>&1; then
-        printf '%s✓%s\n' "$green" "$reset"
-    else
-        # No key, no quota, or no model. Stage 6 has already decided and Stage 8
-        # will still escalate; the incident simply arrives without a hypothesis.
-        printf '%s- no hypothesis for %s%s\n' "$dim" "$INCIDENT_DATE" "$reset"
-    fi
+    # /anomalies/analyze answers 200 whether or not it produced anything: a
+    # provider that refused is a partial run, not a broken request. So the body
+    # is what decides, and `curl -f` alone would report success on a run that
+    # generated nothing.
+    #
+    # Retried because the usual refusal is a per-minute token quota, which
+    # clears on its own. Stage 6 has already decided by this point and Stage 8
+    # will escalate regardless - the incident just arrives unexplained.
+    analyse_date() {
+        local target="$1" label="$2" attempt body
+        printf '      %-26s' "$label"
+        for attempt in 1 2 3; do
+            body="$(curl -s -X POST \
+                "http://localhost:${ANALYTICS_API_HOST_PORT:-8001}/anomalies/analyze" \
+                -H 'Content-Type: application/json' \
+                -d "{\"decision_version\":\"stage6-v1\",\"regenerate\":false,\"dates\":[\"${target}\"]}" \
+                --max-time 300 2>/dev/null)"
+            printf '%s\n' "$body" >>/tmp/salesops-pipeline.log
+            if [[ -n "$PYTHON" ]] && printf '%s' "$body" | "$PYTHON" -c '
+import json, sys
+try:
+    report = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if report.get("succeeded", 0) >= 1 or report.get("skipped_existing", 0) >= 1 else 1)
+' 2>/dev/null; then
+                printf '%s✓%s\n' "$green" "$reset"
+                return 0
+            fi
+            (( attempt < 3 )) && sleep 25
+        done
+        printf '%s- none for %s (see /tmp/salesops-pipeline.log)%s\n' "$dim" "$target" "$reset"
+        return 0
+    }
+
+    analyse_date "$INCIDENT_DATE" "incident hypothesis"
 
     # The same quota problem reaches the notified anomalies. A notification
     # carries a hypothesis only if one exists by the time Stage 8 runs, and the
-    # minor days are last in date order, so on a free tier they never get one.
-    # Asked for by name here for the same reason as the incident above.
+    # minor days come last in date order, so on a free tier they never get one.
     minor_pending="$(docker compose exec -T postgres psql -U "${POSTGRES_USER:-salesops}" \
         -d "${POSTGRES_DB:-salesops}" -qtA -c "
         SELECT d.calendar_date FROM salesops.anomaly_decisions d
@@ -234,17 +258,7 @@ else
         WHERE d.is_anomaly AND d.severity = 'minor' AND d.routing = 'auto_notify'
           AND h.hypothesis_id IS NULL
         ORDER BY d.anomaly_score DESC LIMIT 1;" 2>/dev/null | tr -d '\r' || true)"
-    if [[ -n "$minor_pending" ]]; then
-        printf '      %-26s' "notified hypothesis"
-        if curl -sf -X POST "http://localhost:${ANALYTICS_API_HOST_PORT:-8001}/anomalies/analyze" \
-               -H 'Content-Type: application/json' \
-               -d "{\"decision_version\":\"stage6-v1\",\"regenerate\":false,\"dates\":[\"${minor_pending}\"]}" \
-               --max-time 300 >>/tmp/salesops-pipeline.log 2>&1; then
-            printf '%s✓%s\n' "$green" "$reset"
-        else
-            printf '%s- none for %s%s\n' "$dim" "$minor_pending" "$reset"
-        fi
-    fi
+    [[ -n "$minor_pending" ]] && analyse_date "$minor_pending" "notified hypothesis"
 
     run_workflow salesopsNotify01  "notification and review"
     run_workflow salesopsRemed01   "remediation execution"
