@@ -286,6 +286,7 @@ class Metabase:
                     "card_id": None,
                     "visualization_settings": {
                         "text": entry["text"],
+                        **entry.get("settings", {}),
                         "virtual_card": {
                             "name": None, "display": "text",
                             "visualization_settings": {},

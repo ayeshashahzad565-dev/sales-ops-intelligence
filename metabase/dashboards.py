@@ -532,7 +532,7 @@ CARDS = [
     ),
     _card(
         "exec_layers",
-        "How to read this dashboard",
+        "The eight layers, in reading order",
         """
         SELECT layer_rank         AS "Read in this order",
                layer_label        AS "Layer",
@@ -889,8 +889,18 @@ CARDS_BY_KEY = {c["key"]: c for c in CARDS}
 
 
 def _text(text, row, col, size_x, size_y):
+    """A section header.
+
+    Metabase renders markdown from the top of the panel and does not grow the
+    panel to fit it, so the height has to match the copy: too small clips the
+    last line, too large leaves the heading floating above a pool of empty
+    background. Centring vertically makes the second failure harmless, which
+    means a heading that wraps on a narrow window still looks deliberate.
+    """
     return {"kind": "text", "text": text, "row": row, "col": col,
-            "size_x": size_x, "size_y": size_y}
+            "size_x": size_x, "size_y": size_y,
+            "settings": {"text.align_vertical": "middle",
+                         "text.align_horizontal": "left"}}
 
 
 def _viz(key, row, col, size_x, size_y):
@@ -931,36 +941,36 @@ DASHBOARDS = [
             _viz("exec_kpi_refund_rate", 3, 18, 6, 3),
 
             _text("## Revenue against its own day-of-week baseline",
-                  6, 0, 24, 2),
-            _viz("exec_revenue_vs_baseline", 8, 0, 24, 7),
-            _viz("exec_orders", 15, 0, 8, 5),
-            _viz("exec_aov", 15, 8, 8, 5),
-            _viz("exec_refund_rate", 15, 16, 8, 5),
-            _viz("exec_headline", 20, 0, 24, 5),
+                  6, 0, 24, 1),
+            _viz("exec_revenue_vs_baseline", 7, 0, 24, 7),
+            _viz("exec_orders", 14, 0, 8, 5),
+            _viz("exec_aov", 14, 8, 8, 5),
+            _viz("exec_refund_rate", 14, 16, 8, 5),
+            _viz("exec_headline", 19, 0, 24, 5),
 
             _text("## First a statistical signal, then a deterministic decision",
-                  25, 0, 24, 2),
-            _viz("exec_severity", 27, 0, 24, 5),
-            _viz("exec_timeline", 32, 0, 24, 6),
-            _viz("exec_actionable", 38, 0, 24, 6),
+                  24, 0, 24, 1),
+            _viz("exec_severity", 25, 0, 24, 5),
+            _viz("exec_timeline", 30, 0, 24, 6),
+            _viz("exec_actionable", 36, 0, 24, 6),
 
             _text("## Nothing below this line happened without a person",
-                  44, 0, 24, 2),
+                  42, 0, 24, 1),
             # Full width, not half: these carry seven and eight columns each, and
             # a horizontal scrollbar inside a panel is the sign that the panel
             # was sized for the layout rather than for its data.
-            _viz("exec_needs_review", 46, 0, 24, 6),
-            _viz("exec_reviews", 52, 0, 24, 5),
-            _viz("exec_notifications", 57, 0, 12, 5),
-            _viz("exec_remediation", 57, 12, 12, 5),
+            _viz("exec_needs_review", 43, 0, 24, 6),
+            _viz("exec_reviews", 49, 0, 24, 5),
+            _viz("exec_notifications", 54, 0, 12, 5),
+            _viz("exec_remediation", 54, 12, 12, 5),
 
             _text("## Operational health, in its own vocabulary",
-                  62, 0, 24, 2),
-            _viz("exec_health", 64, 0, 24, 7),
-            _viz("exec_attention", 71, 0, 24, 6),
+                  59, 0, 24, 1),
+            _viz("exec_health", 60, 0, 24, 7),
+            _viz("exec_attention", 67, 0, 24, 6),
 
-            _text("## How to read this dashboard", 77, 0, 24, 2),
-            _viz("exec_layers", 79, 0, 24, 7),
+            _text("## How to read this dashboard", 73, 0, 24, 1),
+            _viz("exec_layers", 74, 0, 24, 7),
         ],
     },
     {
