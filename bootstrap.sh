@@ -15,7 +15,7 @@
 #   4. apply the migrations         V001..V013, then 277 schema checks
 #   5. import the workflows         10 workflows + the database credential
 #   6. run the pipeline once        ingestion -> ... -> maintenance, in order
-#   7. provision the dashboards     4 dashboards, 31 cards, read-only role
+#   7. provision the dashboards     four dashboards, read-only role
 #   8. report                       what was built and where to look
 #
 # Step 6 is why this script exists. Every workflow is on a daily schedule, so a
@@ -321,7 +321,12 @@ say "Provisioning the dashboards"
 # ---------------------------------------------------------------------------
 ./metabase/provision.sh >/tmp/salesops-metabase.log 2>&1 \
     || { tail -20 /tmp/salesops-metabase.log; die "dashboard provisioning failed."; }
-ok "4 dashboards and 31 cards, served through a read-only role"
+# Counted from what provisioning actually reported rather than stated here.
+# A hardcoded total is wrong the first time anyone adds a card, and this line
+# is the one a reader is most likely to take on trust.
+provisioned_cards="$(grep -oE '[0-9]+ card\(s\) in place' /tmp/salesops-metabase.log     | grep -oE '^[0-9]+' | tail -1 || true)"
+provisioned_boards="$(grep -cE 'dashboard/[0-9]+$' /tmp/salesops-metabase.log || true)"
+ok "${provisioned_boards:-0} dashboards and ${provisioned_cards:-0} cards, served through a read-only role"
 
 
 # ---------------------------------------------------------------------------
