@@ -22,6 +22,7 @@ in grid units.
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import date, timedelta
 from pathlib import Path
@@ -97,6 +98,71 @@ _INCIDENT_DATE_TAG = {
 }
 
 
+# ===========================================================================
+# The visual vocabulary
+# ===========================================================================
+# Colour carries meaning here or it is not used. There is no decorative palette:
+# every hex below is bound to a state the pipeline actually stores, and the two
+# vocabularies Stage 6 and Stage 10 keep apart stay apart on screen too - an
+# anomaly is critical/major/minor, a component is healthy/warning/degraded, and
+# no colour is shared between a severity and a health status by accident.
+CRITICAL = "#C4304A"   # a deep red; loud enough to find, not an alarm klaxon
+MAJOR    = "#D97706"   # amber - needs a person, but not tonight
+MINOR    = "#5B677D"   # slate - real, and deliberately quiet
+GOOD     = "#0F9D6E"   # resolved, healthy, executed
+NEUTRAL  = "#64748B"   # states that are neither good nor bad
+
+# Series colours. The measured line is the subject; the baseline it is judged
+# against is a reference and recedes, because drawing them as equals is what
+# makes a chart hard to read at a glance.
+MEASURED = "#4C7DF0"
+BASELINE = "#94A3B8"
+
+
+def _fmt(column, **settings):
+    """A column_settings entry. Metabase keys these by a JSON-encoded ref."""
+    return {json.dumps(["name", column]): settings}
+
+
+def _money(column, decimals=0):
+    return _fmt(column, number_style="currency", currency="USD",
+                currency_style="symbol", currency_in_header=False, decimals=decimals)
+
+
+def _percent(column, decimals=1):
+    return _fmt(column, number_style="percent", decimals=decimals)
+
+
+def _plain(column, decimals=0):
+    return _fmt(column, number_style="decimal", decimals=decimals)
+
+
+def _paint(column, value, colour):
+    """Colour a cell when it holds exactly `value`."""
+    return {"type": "single", "columns": [column], "operator": "=",
+            "value": value, "color": colour, "highlight_row": False}
+
+
+def _severity_colours(column):
+    """Stage 6's vocabulary. Used wherever a severity is rendered."""
+    return [
+        _paint(column, "critical", CRITICAL),
+        _paint(column, "major", MAJOR),
+        _paint(column, "minor", MINOR),
+        _paint(column, "none", NEUTRAL),
+    ]
+
+
+def _health_colours(column):
+    """Stage 10's vocabulary, which shares no word with Stage 6's."""
+    return [
+        _paint(column, "failed", CRITICAL),
+        _paint(column, "degraded", CRITICAL),
+        _paint(column, "warning", MAJOR),
+        _paint(column, "healthy", GOOD),
+    ]
+
+
 def _card(key, name, sql, display="table", description="", settings=None, tags=None):
     return {
         "key": key,
@@ -112,27 +178,77 @@ def _card(key, name, sql, display="table", description="", settings=None, tags=N
 # ===========================================================================
 # Executive cards
 # ===========================================================================
+def _headline_tile(key, name, metric_key, description, value_settings):
+    """One KPI, one number, one card.
+
+    The five headline figures used to be a single eight-column table, which put
+    the most important number on the dashboard behind a horizontal scrollbar and
+    gave it the same visual weight as its own metadata. A number a person is
+    meant to read at a glance should be rendered as a number.
+    """
+    return _card(
+        key, name,
+        f"""
+        SELECT metric_value AS "{name}"
+        FROM salesops.exec_headline_kpis
+        WHERE metric_key = '{metric_key}'
+        """,
+        display="scalar",
+        description=description,
+        settings={"column_settings": value_settings, "scalar.field": name},
+    )
+
+
 CARDS = [
+    _headline_tile(
+        "exec_kpi_revenue", "Net revenue", "net_revenue_usd",
+        "The latest day whose revenue is complete - a day still missing exchange "
+        "rates would understate it, so it is not shown here until it is whole.",
+        _money("Net revenue"),
+    ),
+    _headline_tile(
+        "exec_kpi_orders", "Orders", "orders_count",
+        "Orders on the same complete day.",
+        _plain("Orders"),
+    ),
+    _headline_tile(
+        "exec_kpi_aov", "Average order value", "average_order_value_usd",
+        "Net revenue divided by orders, as Stage 4 stored it.",
+        _money("Average order value", decimals=2),
+    ),
+    _headline_tile(
+        "exec_kpi_refund_rate", "Refund rate", "refund_rate",
+        "Refunds as a share of gross revenue.",
+        _percent("Refund rate", decimals=2),
+    ),
     _card(
         "exec_headline",
-        "Headline KPIs",
+        "How each figure compares",
         """
-        SELECT metric_label       AS "Metric",
-               metric_value       AS "Value",
-               unit               AS "Unit",
-               comparison_value   AS "Compared with",
-               comparison_label   AS "Comparison",
-               delta_pct          AS "Delta %",
-               as_of_date         AS "As of (complete day)",
-               latest_loaded_date AS "Latest loaded day"
+        SELECT metric_label     AS "Metric",
+               metric_value     AS "Value",
+               comparison_value AS "Compared with",
+               comparison_label AS "Comparison",
+               delta_pct        AS "Delta %",
+               as_of_date       AS "As of (complete day)"
         FROM salesops.exec_headline_kpis
         ORDER BY metric_rank
         """,
         description=(
             "Observed facts only. 'As of' is the latest day whose revenue is "
-            "complete; a later 'Latest loaded day' means the newest day is still "
-            "missing exchange rates and would understate revenue."
+            "complete. Each metric names the thing it was compared against, "
+            "because a percentage without its comparison is not a fact."
         ),
+        settings={
+            "column_settings": {
+                **_plain("Delta %", decimals=2),
+            },
+            "table.column_formatting": [
+                {"type": "range", "columns": ["Delta %"],
+                 "colors": [CRITICAL, "#FFFFFF", GOOD], "min_type": "custom",
+                 "max_type": "custom", "min_value": -50, "max_value": 50},
+            ],
+        },
     ),
     _card(
         "exec_revenue_vs_baseline",
@@ -153,11 +269,26 @@ CARDS = [
         settings={
             "graph.dimensions": ["Date"],
             "graph.metrics": ["Net revenue (USD)", "Day-of-week baseline (USD)"],
+            # The measurement is the subject and the baseline is the reference it
+            # is read against. Drawn in equally saturated colours the eye cannot
+            # tell which is which, and the chart becomes two competing lines
+            # rather than one line and its context.
+            "series_settings": {
+                "Net revenue (USD)": {"color": MEASURED, "line.width": 2},
+                "Day-of-week baseline (USD)": {
+                    "color": BASELINE, "line.style": "dashed", "line.width": 1,
+                },
+            },
+            "graph.x_axis.title_text": "",
+            "graph.y_axis.title_text": "",
+            "graph.show_values": False,
+            "column_settings": {**_money("Net revenue (USD)"),
+                                **_money("Day-of-week baseline (USD)")},
         },
     ),
     _card(
         "exec_orders",
-        "Orders per day",
+        "Orders per day, last 60 days",
         """
         SELECT calendar_date AS "Date", orders_count AS "Orders"
         FROM salesops.exec_kpi_daily
@@ -165,11 +296,16 @@ CARDS = [
         ORDER BY calendar_date
         """,
         display="bar",
-        settings={"graph.dimensions": ["Date"], "graph.metrics": ["Orders"]},
+        settings={
+            "graph.dimensions": ["Date"], "graph.metrics": ["Orders"],
+            "series_settings": {"Orders": {"color": MEASURED}},
+            "graph.x_axis.title_text": "", "graph.y_axis.title_text": "",
+            "graph.show_values": False,
+        },
     ),
     _card(
         "exec_aov",
-        "Average order value",
+        "Average order value, last 60 days",
         """
         SELECT calendar_date AS "Date",
                average_order_value_usd AS "AOV (USD)"
@@ -178,11 +314,16 @@ CARDS = [
         ORDER BY calendar_date
         """,
         display="line",
-        settings={"graph.dimensions": ["Date"], "graph.metrics": ["AOV (USD)"]},
+        settings={
+            "graph.dimensions": ["Date"], "graph.metrics": ["AOV (USD)"],
+            "series_settings": {"AOV (USD)": {"color": MEASURED, "line.width": 2}},
+            "graph.x_axis.title_text": "", "graph.y_axis.title_text": "",
+            "column_settings": _money("AOV (USD)", decimals=0),
+        },
     ),
     _card(
         "exec_refund_rate",
-        "Refund rate",
+        "Refund rate, last 60 days",
         """
         SELECT calendar_date AS "Date", refund_rate AS "Refund rate"
         FROM salesops.exec_kpi_daily
@@ -190,7 +331,14 @@ CARDS = [
         ORDER BY calendar_date
         """,
         display="line",
-        settings={"graph.dimensions": ["Date"], "graph.metrics": ["Refund rate"]},
+        settings={
+            "graph.dimensions": ["Date"], "graph.metrics": ["Refund rate"],
+            # Amber, not the measured blue: a refund rate rising is the one series
+            # on this row where up is bad.
+            "series_settings": {"Refund rate": {"color": MAJOR, "line.width": 2}},
+            "graph.x_axis.title_text": "", "graph.y_axis.title_text": "",
+            "column_settings": _percent("Refund rate", decimals=1),
+        },
     ),
     _card(
         "exec_severity",
@@ -209,6 +357,10 @@ CARDS = [
             "shortfall and an unexplained surplus are both anomalies and netting "
             "them off would hide both."
         ),
+        settings={
+            "table.column_formatting": _severity_colours("Severity"),
+            "column_settings": _money("Absolute revenue delta (USD)"),
+        },
     ),
     _card(
         "exec_actionable",
@@ -230,6 +382,10 @@ CARDS = [
             "'Hypothesis exists' is a boolean on purpose. What the model said is "
             "on the investigation dashboard, below the evidence, not here."
         ),
+        settings={
+            "table.column_formatting": _severity_colours("Severity"),
+            "column_settings": _money("Revenue delta (USD)"),
+        },
     ),
     _card(
         "exec_needs_review",
@@ -252,6 +408,10 @@ CARDS = [
             "human_review_required is Stage 6's own column, not a severity filter "
             "applied here."
         ),
+        settings={
+            "table.column_formatting": _severity_colours("Severity"),
+            "column_settings": _money("Revenue delta (USD)"),
+        },
     ),
     _card(
         "exec_notifications",
@@ -287,6 +447,7 @@ CARDS = [
             "critical/major/minor is the ANOMALY; warning/overdue/critical_overdue "
             "is how long the REVIEW has waited."
         ),
+        settings={"table.column_formatting": _severity_colours("Anomaly severity")},
     ),
     _card(
         "exec_remediation",
@@ -327,6 +488,7 @@ CARDS = [
             "healthy | warning | degraded | failed. A pipeline's health is not an "
             "anomaly severity and the two vocabularies share no word."
         ),
+        settings={"table.column_formatting": _health_colours("Health")},
     ),
     _card(
         "exec_attention",
@@ -750,36 +912,55 @@ DASHBOARDS = [
         ),
         "parameters": [],
         "cards": [
+            # Text cards were clipping their own last line. Metabase does not
+            # grow a text panel to fit its markdown, so the height is part of
+            # the copy: change one and check the other.
             _text(
                 "# Sales & Revenue Operations\n"
                 "**Observed facts** are measured. **Statistical signals** say a day was "
                 "unusual. **Business decisions** come from fixed thresholds. Nothing on "
                 "this page was written by a language model - see *How to read this "
                 "dashboard* at the bottom.",
-                0, 0, 24, 2),
-            _viz("exec_headline", 2, 0, 24, 4),
-            _text("## Trend", 6, 0, 24, 1),
-            _viz("exec_revenue_vs_baseline", 7, 0, 24, 6),
-            _viz("exec_orders", 13, 0, 8, 5),
-            _viz("exec_aov", 13, 8, 8, 5),
-            _viz("exec_refund_rate", 13, 16, 8, 5),
+                0, 0, 24, 3),
+
+            # The KPI strip. Four numbers, read at a glance, before anything
+            # asks the reader to interpret a chart or scan a table.
+            _viz("exec_kpi_revenue", 3, 0, 6, 3),
+            _viz("exec_kpi_orders", 3, 6, 6, 3),
+            _viz("exec_kpi_aov", 3, 12, 6, 3),
+            _viz("exec_kpi_refund_rate", 3, 18, 6, 3),
+
+            _text("## Trend — measured against its own day-of-week baseline",
+                  6, 0, 24, 2),
+            _viz("exec_revenue_vs_baseline", 8, 0, 24, 7),
+            _viz("exec_orders", 15, 0, 8, 5),
+            _viz("exec_aov", 15, 8, 8, 5),
+            _viz("exec_refund_rate", 15, 16, 8, 5),
+            _viz("exec_headline", 20, 0, 24, 5),
+
             _text("## Anomalies — statistical signal, then deterministic decision",
-                  18, 0, 24, 1),
-            _viz("exec_severity", 19, 0, 10, 5),
-            _viz("exec_timeline", 19, 10, 14, 5),
-            _viz("exec_actionable", 24, 0, 24, 6),
+                  25, 0, 24, 2),
+            _viz("exec_severity", 27, 0, 24, 5),
+            _viz("exec_timeline", 32, 0, 24, 6),
+            _viz("exec_actionable", 38, 0, 24, 6),
+
             _text("## Human in the loop — nothing below happened without a person",
-                  30, 0, 24, 1),
-            _viz("exec_needs_review", 31, 0, 12, 6),
-            _viz("exec_reviews", 31, 12, 12, 6),
-            _viz("exec_notifications", 37, 0, 12, 5),
-            _viz("exec_remediation", 37, 12, 12, 5),
+                  44, 0, 24, 2),
+            # Full width, not half: these carry seven and eight columns each, and
+            # a horizontal scrollbar inside a panel is the sign that the panel
+            # was sized for the layout rather than for its data.
+            _viz("exec_needs_review", 46, 0, 24, 6),
+            _viz("exec_reviews", 52, 0, 24, 5),
+            _viz("exec_notifications", 57, 0, 12, 5),
+            _viz("exec_remediation", 57, 12, 12, 5),
+
             _text("## Operational health — a different vocabulary, deliberately",
-                  42, 0, 24, 1),
-            _viz("exec_health", 43, 0, 12, 7),
-            _viz("exec_attention", 43, 12, 12, 7),
-            _text("## How to read this dashboard", 50, 0, 24, 1),
-            _viz("exec_layers", 51, 0, 24, 6),
+                  62, 0, 24, 2),
+            _viz("exec_health", 64, 0, 24, 7),
+            _viz("exec_attention", 71, 0, 24, 6),
+
+            _text("## How to read this dashboard", 77, 0, 24, 2),
+            _viz("exec_layers", 79, 0, 24, 7),
         ],
     },
     {
