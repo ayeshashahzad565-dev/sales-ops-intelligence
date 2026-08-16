@@ -45,6 +45,7 @@ from dashboards import (  # noqa: E402
     COLLECTION_NAME,
     DASHBOARDS,
     DATABASE_NAME,
+    dashboard_tabs,
 )
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -280,15 +281,32 @@ class Metabase:
 
     def fill_dashboard(self, spec, dashboard_id: int, card_ids: dict,
                        dashboard_ids: dict) -> None:
+        # Metabase resolves negative ids in a single PUT: tabs and the cards
+        # that reference them are created together, so a tab id is a promise
+        # made here and kept by the server.
+        tabs = dashboard_tabs(spec)
+        tabbed = "tabs" in spec
+        tab_payload = [
+            {"id": -(index + 1), "name": tab["name"], "position": index}
+            for index, tab in enumerate(tabs)
+        ] if tabbed else []
+
         dashcards = []
-        next_placeholder = -1
-        for entry in spec["cards"]:
+        next_placeholder = -1000
+        placements = [
+            (tab_index, entry)
+            for tab_index, tab in enumerate(tabs)
+            for entry in tab["cards"]
+        ]
+        for tab_index, entry in placements:
             common = {
                 "id": next_placeholder,
                 "row": entry["row"], "col": entry["col"],
                 "size_x": entry["size_x"], "size_y": entry["size_y"],
                 "series": [], "parameter_mappings": [],
             }
+            if tabbed:
+                common["dashboard_tab_id"] = -(tab_index + 1)
             next_placeholder -= 1
 
             if entry["kind"] == "text":
@@ -352,6 +370,7 @@ class Metabase:
             "description": spec["description"],
             "parameters": spec["parameters"],
             "dashcards": dashcards,
+            "tabs": tab_payload,
             # Metabase centres a dashboard in a fixed-width column by default,
             # which leaves a wide empty margin either side and squeezes tables
             # that already carry seven or eight columns. These panels are sized

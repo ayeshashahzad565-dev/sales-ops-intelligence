@@ -73,7 +73,7 @@ def test_card_keys_and_names_are_unique(catalogue):
 
 def test_every_dashboard_card_exists(catalogue):
     for dashboard in catalogue.DASHBOARDS:
-        for entry in dashboard["cards"]:
+        for entry in catalogue.dashboard_cards(dashboard):
             if entry["kind"] == "card":
                 assert entry["card"] in catalogue.CARDS_BY_KEY, entry["card"]
 
@@ -83,7 +83,7 @@ def test_every_card_is_placed_on_a_dashboard(catalogue):
     placed = {
         entry["card"]
         for dashboard in catalogue.DASHBOARDS
-        for entry in dashboard["cards"]
+        for entry in catalogue.dashboard_cards(dashboard)
         if entry["kind"] == "card"
     }
     orphans = {c["key"] for c in catalogue.CARDS} - placed
@@ -92,7 +92,7 @@ def test_every_card_is_placed_on_a_dashboard(catalogue):
 
 def test_no_panel_overflows_the_grid(catalogue):
     for dashboard in catalogue.DASHBOARDS:
-        for entry in dashboard["cards"]:
+        for entry in catalogue.dashboard_cards(dashboard):
             assert entry["col"] >= 0
             assert entry["col"] + entry["size_x"] <= GRID_COLUMNS, entry
 
@@ -102,16 +102,21 @@ def test_no_two_panels_overlap(catalogue):
     is invisible rather than missing - which is how a dashboard silently stops
     showing the thing it was built for."""
     for dashboard in catalogue.DASHBOARDS:
-        occupied: dict[tuple[int, int], object] = {}
-        for entry in dashboard["cards"]:
-            for row in range(entry["row"], entry["row"] + entry["size_y"]):
-                for col in range(entry["col"], entry["col"] + entry["size_x"]):
-                    previous = occupied.get((row, col))
-                    assert previous is None, (
-                        f"{dashboard['name']}: {entry} overlaps {previous} "
-                        f"at row {row}, col {col}"
-                    )
-                    occupied[(row, col)] = entry
+        # Per TAB, not per dashboard. A dashcard's position is scoped to its
+        # tab, so two cards on different tabs sharing a row and column is
+        # correct - checking the whole dashboard at once would reject a layout
+        # Metabase renders perfectly well.
+        for tab in catalogue.dashboard_tabs(dashboard):
+            occupied: dict[tuple[int, int], object] = {}
+            for entry in tab["cards"]:
+                for row in range(entry["row"], entry["row"] + entry["size_y"]):
+                    for col in range(entry["col"], entry["col"] + entry["size_x"]):
+                        previous = occupied.get((row, col))
+                        assert previous is None, (
+                            f"{dashboard['name']} / {tab['name']}: {entry} "
+                            f"overlaps {previous} at row {row}, col {col}"
+                        )
+                        occupied[(row, col)] = entry
 
 
 # =============================================================================
@@ -171,7 +176,7 @@ def _cards_of(catalogue, dashboard_key):
     dashboard = next(d for d in catalogue.DASHBOARDS if d["key"] == dashboard_key)
     return [
         catalogue.CARDS_BY_KEY[e["card"]]
-        for e in dashboard["cards"] if e["kind"] == "card"
+        for e in catalogue.dashboard_cards(dashboard) if e["kind"] == "card"
     ]
 
 
@@ -208,11 +213,11 @@ def test_the_investigation_dashboard_warns_before_the_model_panel(catalogue):
     """The warning has to come first on the page, not after."""
     dashboard = next(d for d in catalogue.DASHBOARDS if d["key"] == "investigation")
     warning_rows = [
-        e["row"] for e in dashboard["cards"]
+        e["row"] for e in catalogue.dashboard_cards(dashboard)
         if e["kind"] == "text" and "language-model output" in e["text"]
     ]
     hypothesis_rows = [
-        e["row"] for e in dashboard["cards"]
+        e["row"] for e in catalogue.dashboard_cards(dashboard)
         if e["kind"] == "card" and e["card"] == "inv_hypothesis"
     ]
     assert warning_rows and hypothesis_rows
@@ -220,8 +225,8 @@ def test_the_investigation_dashboard_warns_before_the_model_panel(catalogue):
 
 
 def test_the_executive_dashboard_explains_its_layers(catalogue):
-    keys = {e["card"] for e in
-            next(d for d in catalogue.DASHBOARDS if d["key"] == "executive")["cards"]
+    executive = next(d for d in catalogue.DASHBOARDS if d["key"] == "executive")
+    keys = {e["card"] for e in catalogue.dashboard_cards(executive)
             if e["kind"] == "card"}
     assert "exec_layers" in keys
 
@@ -246,7 +251,7 @@ def test_the_parameter_is_wired_to_the_cards_that_use_it(catalogue):
     dashboard = next(d for d in catalogue.DASHBOARDS if d["key"] == "investigation")
     tag = dashboard["parameter_tag"]
     wired = [
-        e["card"] for e in dashboard["cards"]
+        e["card"] for e in catalogue.dashboard_cards(dashboard)
         if e["kind"] == "card" and tag in catalogue.CARDS_BY_KEY[e["card"]]["template_tags"]
     ]
     assert len(wired) >= 4, wired

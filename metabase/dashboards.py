@@ -924,6 +924,33 @@ def _viz(key, row, col, size_x, size_y, link=None):
     return entry
 
 
+def _tab(name, cards):
+    """One tab, whose rows start again at zero.
+
+    Metabase scopes a dashcard's position to its tab, so two cards on different
+    tabs may sit at the same row and column without colliding. Anything that
+    walks the layout - provisioning, the overlap test - has to respect that, or
+    it either reports collisions that cannot happen or misses ones that can.
+    """
+    return {"name": name, "cards": cards}
+
+
+def dashboard_tabs(spec):
+    """Every dashboard as a list of tabs, whether or not it declares any.
+
+    A dashboard without tabs is one unnamed tab. Giving both shapes the same
+    interface keeps the special case in one function instead of in every caller.
+    """
+    if "tabs" in spec:
+        return spec["tabs"]
+    return [{"name": None, "cards": spec["cards"]}]
+
+
+def dashboard_cards(spec):
+    """Every placed card on a dashboard, tabs flattened."""
+    return [entry for tab in dashboard_tabs(spec) for entry in tab["cards"]]
+
+
 #: Clicking a row that names a date opens that date's investigation. This is the
 #: only navigation on the platform, and it runs in the one direction the
 #: architecture allows: from a summary down into the evidence beneath it, never
@@ -948,56 +975,67 @@ DASHBOARDS = [
             "hypothesis exists."
         ),
         "parameters": [],
-        "cards": [
-            # Text cards were clipping their own last line. Metabase does not
-            # grow a text panel to fit its markdown, so the height is part of
-            # the copy: change one and check the other.
-            _text(
-                "# Sales & Revenue Operations\n"
-                "**Observed facts** are measured. **Statistical signals** say a day was "
-                "unusual. **Business decisions** come from fixed thresholds. Nothing on "
-                "this page was written by a language model - see *How to read this "
-                "dashboard* at the bottom.",
-                0, 0, 24, 3),
+        # Five tabs rather than eighty rows of scrolling. The split follows the
+        # order the pipeline itself runs in, so moving through the tabs is
+        # moving downstream: what happened, what was unusual about it, who was
+        # asked, and whether the machinery that did all that is healthy.
+        "tabs": [
+            _tab("Overview", [
+                # Metabase neither grows nor shrinks a text panel to fit its
+                # markdown, so the height is part of the copy.
+                _text(
+                    "# Sales & Revenue Operations\n"
+                    "**Observed facts** are measured. **Statistical signals** say a day "
+                    "was unusual. **Business decisions** come from fixed thresholds. "
+                    "Nothing on this page was written by a language model; the *How to "
+                    "read* tab says which layer every panel belongs to.",
+                    0, 0, 24, 3),
 
-            # The KPI strip. Four numbers, read at a glance, before anything
-            # asks the reader to interpret a chart or scan a table.
-            _viz("exec_kpi_revenue", 3, 0, 6, 3),
-            _viz("exec_kpi_orders", 3, 6, 6, 3),
-            _viz("exec_kpi_aov", 3, 12, 6, 3),
-            _viz("exec_kpi_refund_rate", 3, 18, 6, 3),
+                # Four numbers read at a glance, before anything asks the reader
+                # to interpret a chart or scan a table.
+                _viz("exec_kpi_revenue", 3, 0, 6, 3),
+                _viz("exec_kpi_orders", 3, 6, 6, 3),
+                _viz("exec_kpi_aov", 3, 12, 6, 3),
+                _viz("exec_kpi_refund_rate", 3, 18, 6, 3),
 
-            _text("## Revenue against its own day-of-week baseline",
-                  6, 0, 24, 1),
-            _viz("exec_revenue_vs_baseline", 7, 0, 24, 7),
-            _viz("exec_orders", 14, 0, 8, 5),
-            _viz("exec_aov", 14, 8, 8, 5),
-            _viz("exec_refund_rate", 14, 16, 8, 5),
-            _viz("exec_headline", 19, 0, 24, 5),
+                _text("## Revenue against its own day-of-week baseline", 6, 0, 24, 1),
+                _viz("exec_revenue_vs_baseline", 7, 0, 24, 7),
+                _viz("exec_orders", 14, 0, 8, 5),
+                _viz("exec_aov", 14, 8, 8, 5),
+                _viz("exec_refund_rate", 14, 16, 8, 5),
+                _viz("exec_headline", 19, 0, 24, 5),
+            ]),
 
-            _text("## First a statistical signal, then a deterministic decision",
-                  24, 0, 24, 1),
-            _viz("exec_severity", 25, 0, 24, 5),
-            _viz("exec_timeline", 30, 0, 24, 6, link=TO_INVESTIGATION),
-            _viz("exec_actionable", 36, 0, 24, 6, link=TO_INVESTIGATION),
+            _tab("Anomalies", [
+                _text("## First a statistical signal, then a deterministic decision\n"
+                      "Click any row to open that day's investigation.",
+                      0, 0, 24, 2),
+                _viz("exec_severity", 2, 0, 24, 5),
+                _viz("exec_timeline", 7, 0, 24, 7, link=TO_INVESTIGATION),
+                _viz("exec_actionable", 14, 0, 24, 7, link=TO_INVESTIGATION),
+            ]),
 
-            _text("## Nothing below this line happened without a person",
-                  42, 0, 24, 1),
-            # Full width, not half: these carry seven and eight columns each, and
-            # a horizontal scrollbar inside a panel is the sign that the panel
-            # was sized for the layout rather than for its data.
-            _viz("exec_needs_review", 43, 0, 24, 6, link=TO_INVESTIGATION),
-            _viz("exec_reviews", 49, 0, 24, 5),
-            _viz("exec_notifications", 54, 0, 12, 5),
-            _viz("exec_remediation", 54, 12, 12, 5),
+            _tab("Human review", [
+                _text("## Nothing on this tab happened without a person", 0, 0, 24, 1),
+                _viz("exec_needs_review", 1, 0, 24, 6, link=TO_INVESTIGATION),
+                _viz("exec_reviews", 7, 0, 24, 5),
+                _viz("exec_notifications", 12, 0, 12, 5),
+                _viz("exec_remediation", 12, 12, 12, 5),
+            ]),
 
-            _text("## Operational health, in its own vocabulary",
-                  59, 0, 24, 1),
-            _viz("exec_health", 60, 0, 24, 7),
-            _viz("exec_attention", 67, 0, 24, 6),
+            _tab("Operations", [
+                _text("## Operational health, in its own vocabulary", 0, 0, 24, 1),
+                _viz("exec_health", 1, 0, 24, 7),
+                _viz("exec_attention", 8, 0, 24, 6),
+            ]),
 
-            _text("## How to read this dashboard", 73, 0, 24, 1),
-            _viz("exec_layers", 74, 0, 24, 7),
+            _tab("How to read", [
+                _text("## Every panel belongs to exactly one layer\n"
+                      "One of the eight is model-generated. A `CHECK` constraint in the "
+                      "database makes it impossible for a second one to claim it is.",
+                      0, 0, 24, 2),
+                _viz("exec_layers", 2, 0, 24, 8),
+            ]),
         ],
     },
     {
