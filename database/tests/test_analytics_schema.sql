@@ -944,6 +944,13 @@ BEGIN
         INSERT INTO salesops.anomaly_hypotheses (
             anomaly_id, decision_id, calendar_date, decision_version,
             -- The lie: a severity that disagrees with the decision referenced.
+            --
+            -- Derived from the decision rather than hardcoded. A fixed 'minor'
+            -- here is only a lie when the decision picked above is not itself
+            -- minor, and decisions are seeded in date order, so whether this
+            -- check tested anything depended on which severity happened to land
+            -- on the earliest actionable date. When it did not, the guard
+            -- correctly accepted a truthful row and the check read as a failure.
             severity, routing, decision,
             summary, confidence, primary_hypothesis,
             supporting_evidence, alternative_hypotheses, missing_evidence, recommended_checks,
@@ -951,7 +958,9 @@ BEGIN
         ) VALUES (
             v_decision.anomaly_id, v_decision.decision_id, v_decision.calendar_date,
             v_decision.decision_version,
-            'minor', 'auto_notify', 'action_required',
+            CASE WHEN v_decision.severity = 'minor' THEN 'critical' ELSE 'minor' END,
+            CASE WHEN v_decision.routing = 'auto_notify' THEN 'human_review' ELSE 'auto_notify' END,
+            v_decision.decision,
             'schema test', 'low', 'schema test',
             '[{"metric":"x"}]'::jsonb, '[]'::jsonb, '[]'::jsonb, '[]'::jsonb,
             'schema-test', 'schema-test-model', 'stage7-prompt-v0', 'digest'
