@@ -633,6 +633,15 @@ CARDS = [
             "took part in any of it."
         ),
         tags=_INCIDENT_DATE_TAG,
+        settings={
+            "table.column_formatting": _severity_colours("Severity"),
+            "column_settings": {
+                **_money("Expected revenue (USD)"),
+                **_money("Actual revenue (USD)"),
+                **_money("Delta (USD)", show_mini_bar=True),
+                **_plain("Delta %", decimals=2),
+            },
+        },
     ),
     _card(
         "inv_hypothesis",
@@ -696,6 +705,13 @@ CARDS = [
         ORDER BY calendar_date DESC
         """,
         description="Copy a date from here into the filter above.",
+        settings={
+            "table.column_formatting": _severity_colours("Severity"),
+            "column_settings": {
+                **_money("Net revenue (USD)"),
+                **_money("Baseline (USD)"),
+            },
+        },
     ),
 
     # =======================================================================
@@ -739,6 +755,7 @@ CARDS = [
         FROM salesops.exec_pipeline_health
         ORDER BY status_rank, component
         """,
+        settings={"table.column_formatting": _health_colours("Health")},
     ),
     _card(
         "ops_stale",
@@ -795,6 +812,9 @@ CARDS = [
             "Operational ageing only. Nothing changes a review's state because of "
             "its age - 'nobody has looked at this' is not a decision."
         ),
+        settings={
+            "table.column_formatting": _severity_colours("Anomaly severity"),
+        },
     ),
     _card(
         "ops_unknown",
@@ -817,6 +837,9 @@ CARDS = [
             "twice and failing it might claim it never happened, so Stage 10 does "
             "neither: it records the uncertainty and waits for a person."
         ),
+        settings={
+            "table.column_formatting": _severity_colours("Anomaly severity"),
+        },
     ),
     _card(
         "ops_events",
