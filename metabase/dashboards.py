@@ -930,7 +930,7 @@ DASHBOARDS = [
             _viz("exec_kpi_aov", 3, 12, 6, 3),
             _viz("exec_kpi_refund_rate", 3, 18, 6, 3),
 
-            _text("## Trend — measured against its own day-of-week baseline",
+            _text("## Revenue against its own day-of-week baseline",
                   6, 0, 24, 2),
             _viz("exec_revenue_vs_baseline", 8, 0, 24, 7),
             _viz("exec_orders", 15, 0, 8, 5),
@@ -938,13 +938,13 @@ DASHBOARDS = [
             _viz("exec_refund_rate", 15, 16, 8, 5),
             _viz("exec_headline", 20, 0, 24, 5),
 
-            _text("## Anomalies — statistical signal, then deterministic decision",
+            _text("## First a statistical signal, then a deterministic decision",
                   25, 0, 24, 2),
             _viz("exec_severity", 27, 0, 24, 5),
             _viz("exec_timeline", 32, 0, 24, 6),
             _viz("exec_actionable", 38, 0, 24, 6),
 
-            _text("## Human in the loop — nothing below happened without a person",
+            _text("## Nothing below this line happened without a person",
                   44, 0, 24, 2),
             # Full width, not half: these carry seven and eight columns each, and
             # a horizontal scrollbar inside a panel is the sign that the panel
@@ -954,7 +954,7 @@ DASHBOARDS = [
             _viz("exec_notifications", 57, 0, 12, 5),
             _viz("exec_remediation", 57, 12, 12, 5),
 
-            _text("## Operational health — a different vocabulary, deliberately",
+            _text("## Operational health, in its own vocabulary",
                   62, 0, 24, 2),
             _viz("exec_health", 64, 0, 24, 7),
             _viz("exec_attention", 71, 0, 24, 6),

@@ -6,7 +6,7 @@
 
 An automated pipeline that ingests sales orders, computes daily KPIs, detects
 revenue anomalies statistically, grades and routes them through deterministic
-SQL rules — auto-notify for minor deviations, human review for major ones — and
+SQL rules (auto-notify for minor deviations, human review for major ones), and
 only then asks an LLM to draft a root-cause hypothesis for the ones that matter.
 
 **The LLM proposes. Deterministic rules decide. A human approves.** Severity and
@@ -29,8 +29,8 @@ waiting on a human.
 | **Tests** | 277 schema checks · 555 service tests · 179 pipeline-SQL checks · 84 API tests |
 | **Model use** | one call, one table, zero authority over any decision |
 
-> **A portfolio project running on a laptop. It is not production-secure** —
-> actors are asserted rather than authenticated, and there is no API auth. See
+> **A portfolio project running on a laptop. It is not production-secure.**
+> Actors are asserted rather than authenticated, and there is no API auth. See
 > [Limitations](docs/LIMITATIONS.md).
 
 ---
@@ -74,8 +74,8 @@ Frankfurter ─► FX Rate Sync ────────────────
 ```
 
 **n8n orchestrates. PostgreSQL enforces integrity. Python does statistics. The
-LLM explains, and never judges.** No business rule lives in an n8n expression —
-validation, dimension resolution and idempotency are all SQL, reviewable and
+LLM explains, and never judges.** No business rule lives in an n8n expression.
+Validation, dimension resolution and idempotency are all SQL, reviewable and
 testable without n8n running.
 
 ---
@@ -93,7 +93,7 @@ began, and no later stage may modify an earlier one's verdict.
 | 3 | Ingestion | Staging, validation, dead-letter, run ledger | [docs](n8n/README.md) |
 | 4 | FX + KPIs | Frankfurter rates, bounded carry-forward, atomic `kpi_daily` | [docs](database/README.md) |
 | 5 | Anomaly detection | Median/MAD baselines per weekday, four signals, no ML | [docs](analytics-service/README.md) |
-| 6 | **Decision layer** | Severity, routing, reason codes — in SQL, before any model | [docs](database/README.md#the-decision-layer--stage-6) |
+| 6 | **Decision layer** | Severity, routing and reason codes, in SQL, before any model | [docs](database/README.md#the-decision-layer--stage-6) |
 | 7 | LLM hypotheses | The only model call. Receives the verdict; cannot change it | [docs](analytics-service/README.md#stage-7--root-cause-hypotheses) |
 | 8 | Delivery + review | Notifications, review queue, state machine, audit trail | [docs](analytics-service/README.md#stage-8--delivery-and-human-review) |
 | 9 | **Remediation** | Executes only what a human approved, once, fully attributed | [docs](analytics-service/README.md#stage-9--human-approved-remediation) |
@@ -106,8 +106,8 @@ Full narrative: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## One incident, end to end
 
-`bootstrap.sh` injects one incident — a price collapse and a refund spike on the
-same day — and it runs the whole length of the platform. The investigation
+`bootstrap.sh` injects one incident, a price collapse and a refund spike on the
+same day, and it runs the whole length of the platform. The investigation
 dashboard shows it as ten steps:
 
 ```
@@ -127,7 +127,7 @@ dashboard shows it as ten steps:
 Step 5 is the only line a language model wrote, and step 4 happened before it.
 
 The figures above are from one run. The order generator anchors its ninety days
-to today, so your dates and totals will differ — `bootstrap.sh` records the day
+to today, so your dates and totals will differ. `bootstrap.sh` records the day
 it injected into as `SALESOPS_INCIDENT_DATE`, and the dashboard defaults to it.
 
 ---
@@ -139,20 +139,20 @@ One probabilistic component, downstream of every decision.
 | | Deterministic | Probabilistic |
 |---|---|---|
 | **What** | ingestion, FX, KPIs, z-scores, severity, routing, eligibility, health, ageing | one LLM call per actionable anomaly |
-| **Reproducible** | yes — same inputs, same outputs, forever | no |
+| **Reproducible** | yes; same inputs, same outputs, forever | no |
 | **Can change a verdict** | it *is* the verdict | never |
 | **Audited** | every threshold is a row in a table | provenance stored; the claim is never verified |
 
 On the dashboards this is a column, not a colour. Every presentation view carries
 the layer its content came from, and a `CHECK` constraint makes exactly one of
 the eight layers model-generated. `llm_verified` is `false` on every row that has
-one — because nothing here verifies a hypothesis.
+one, because nothing here verifies a hypothesis.
 
 **Four human gates**, deliberately not collapsible into one call: Stage 6 decides
 whether a person is needed; a reviewer claims and resolves; approving the review
 *proposes* an action; authorising that action is a separate decision by a second
-name. Three different mechanisms enforce it — a trigger, a foreign key, and a
-conditional `UPDATE` — because one function doing all three would be one function
+name. Three different mechanisms enforce it: a trigger, a foreign key and a
+conditional `UPDATE`. One function doing all three would be one function
 to get wrong. [More →](docs/ARCHITECTURE.md#human-in-the-loop)
 
 ---
@@ -170,13 +170,13 @@ cd mock-api          && python -m pytest   # 84  the order API
 
 The schema suite seeds the Stage 6 fixture it needs when the database is empty,
 so a container eleven seconds old proves the same 277 guarantees as a warehouse
-with 90 days of history — including the guard triggers behind authorisation,
+with 90 days of history, including the guard triggers behind authorisation,
 exactly-once execution and reconciliation.
 
 CI runs the linter, that schema suite against a real PostgreSQL 17, the 160
 analytics tests that need no warehouse, and the mock API. It deliberately does
 **not** run the integration suites that need a populated warehouse and an LLM
-key — a badge that quietly skipped a third of the suite would be worse than no
+key. A badge that quietly skipped a third of the suite would be worse than no
 badge. Run those locally after `./bootstrap.sh`.
 
 ---
@@ -202,7 +202,7 @@ badge. Run those locally after `./bootstrap.sh`.
   `executed_by` is a string the caller supplied. The audit trail records what was
   *claimed*. This is the largest security limitation in the project.
 - **No API authentication**, and ports are published to localhost.
-- **Remediation has no external side effect** — the provider records what it was
+- **Remediation has no external side effect.** The provider records what it was
   asked to do. Building a fake ERP would have made the audit trail fiction.
 - **The order data is synthetic**, generated from a fixed seed with anomalies
   injected deliberately.

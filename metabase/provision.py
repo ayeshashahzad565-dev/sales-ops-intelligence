@@ -311,6 +311,11 @@ class Metabase:
             "description": spec["description"],
             "parameters": spec["parameters"],
             "dashcards": dashcards,
+            # Metabase centres a dashboard in a fixed-width column by default,
+            # which leaves a wide empty margin either side and squeezes tables
+            # that already carry seven or eight columns. These panels are sized
+            # for their data, so they get the window.
+            "width": spec.get("width", "full"),
         })
         return dashboard_id
 
