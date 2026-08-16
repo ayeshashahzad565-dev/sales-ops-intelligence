@@ -46,9 +46,13 @@ A detector comparing days against an undifferentiated recent average would rank
 "it is Sunday" as its strongest and most frequent finding, fire ~104 times a
 year, and be switched off within a fortnight.
 
-The live case that makes this concrete:
+The live case that makes this concrete — one run, and the shape of the argument
+rather than the exact figures. The generator anchors its ninety days to today,
+so your dates and totals will differ; `bootstrap.sh` records the days it used as
+`SALESOPS_INCIDENT_DATE` and `SALESOPS_NORMAL_DATE`, and the control day is
+chosen precisely because it has the property this table illustrates:
 
-| | 2026-08-05 (Wed) | 2026-08-02 (Sun) |
+| | injected incident (Wed) | control day (Sun) |
 |---|---|---|
 | vs trailing 7-day mean | 46% | **44.5%** |
 | vs its **own weekday** median | **−65%** | **+30%** |
@@ -1303,14 +1307,16 @@ which is how "no business action is taken" stops being a claim in a README.
 - **Flag rate is ~16% of scored dates (11 of 70).** Stage 5 is deliberately a
   *statistical* filter, not an alerting layer — the specification puts business
   severity in a later stage, and the score is what that stage will threshold on.
-  The separation is visible in the numbers: the injected anomaly scores 8.93
-  while marginal days sit at 2.7–3.6.
+  The separation is visible in the numbers: the injected incident scores several
+  times higher than the marginal days around it.
 
-  Stage 6 now does that thresholding, and the 11 flags resolve to 1 critical,
-  6 major and 4 minor — 7 of 90 days reaching a human, roughly one a fortnight.
-  It also reverses the score ordering where the money justifies it: the
-  highest-scoring day in the series (2026-08-09, 12.94) is `major`, while the
-  injected event at 8.93 is `critical`. See
+  Stage 6 now does that thresholding, resolving the flags into `critical`,
+  `major` and `minor` so that only a handful of the ninety days reach a human —
+  in practice around one a fortnight. It also reverses the score ordering where
+  the money justifies it, grading a loud but cheap day `minor` and a quieter,
+  expensive one `major`. Exact counts depend on the generated series and are not
+  quoted here; the ordering property itself is asserted by
+  [test_stage6_decisions.py](../n8n/tests/test_stage6_decisions.py). See
   [database/README.md](../database/README.md#the-decision-layer--stage-6).
 - **Weekend days are flagged more often than weekdays (25% vs 13%).** This
   reflects the data, not a seasonality artifact: Sunday revenue ranges 1,846 to

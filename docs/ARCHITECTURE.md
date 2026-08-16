@@ -278,7 +278,7 @@ Then open <http://localhost:3000>.
 | Dashboard | What it answers |
 |---|---|
 | **Executive Overview** | Revenue, orders, AOV, refund rate against baseline; anomalies by severity; what is actionable; who is waiting on whom; pipeline health |
-| **Anomaly Investigation** | One incident, layer by layer, in reading order. Defaults to **2026-08-05** |
+| **Anomaly Investigation** | One incident, layer by layer, in reading order. Defaults to the injected incident |
 | **Operational Health** | Per-pipeline runs, stale and overdue items, replays, unknown executions |
 | **Audit Trail** | Every recorded transition: who, when, from what state to what, under which version |
 
@@ -286,15 +286,16 @@ Four dashboards, 31 cards, fifteen views and one reference table, and **zero new
 arithmetic**. Every number was already stored by the stage that owns it.
 [Full documentation →](../metabase/README.md)
 
-#### Following the 2026-08-05 incident
+#### Following the injected incident
 
-The injected anomaly runs the whole length of the platform, and the
-investigation dashboard shows it as ten steps:
+`bootstrap.sh` injects one incident - a price collapse and a refund spike on the
+same day - and it runs the whole length of the platform. The investigation
+dashboard shows it as ten steps:
 
 ```
- 1 orders               52 orders, 136 units                       observed fact
- 2 kpi                  net revenue 4,748.95 USD, AOV 91.33 USD    observed fact
- 3 anomaly              score 8.925, dominant refund, 3 signals    statistical
+ 1 orders               58 orders, 111 units                       observed fact
+ 2 kpi                  net revenue 2,243.43 USD, AOV 38.68 USD    observed fact
+ 3 anomaly              score 14.478, dominant revenue, 3 signals  statistical
  4 decision             critical / human_review /                  deterministic
                         CRITICAL_COMBINED_IMPACT
  5 hypothesis           unverified, stated confidence medium       ▲ LLM
@@ -306,6 +307,10 @@ investigation dashboard shows it as ten steps:
 ```
 
 Step 5 is the only line a language model wrote, and step 4 happened before it.
+
+The figures are from one run. The generator anchors its ninety days to today, so
+your dates and totals will differ; `bootstrap.sh` records the day it injected
+into as `SALESOPS_INCIDENT_DATE` and the dashboard defaults to it.
 
 
 ---

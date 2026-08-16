@@ -66,8 +66,9 @@ explaining the layers.
 
 **Anomaly Investigation** — one incident, layer by layer, in the order it has to
 be read: facts → statistics → decision → hypothesis → missing evidence →
-notification/review → remediation → audit history. Defaults to **2026-08-05**,
-the injected critical anomaly. Change the date filter at the top.
+notification/review → remediation → audit history. Defaults to the incident
+`bootstrap.sh` injected, recorded as `SALESOPS_INCIDENT_DATE`. Change the date
+filter at the top for any other day.
 
 **Operational Health** — Stage 10's vocabulary, unaltered:
 `healthy | warning | degraded | failed`. Per-pipeline runs with the latest

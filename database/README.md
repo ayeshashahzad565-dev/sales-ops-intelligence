@@ -394,13 +394,18 @@ Money gates every escalation, so a statistically spectacular move on a small day
 stays `minor`. Corroboration gates `critical` specifically, so `critical` never
 means "biggest z-score this week".
 
-**The live data demonstrates the distinction rather than asserting it.**
-2026-08-09 carries the highest anomaly score in the series (12.94 — a Sunday at
-3.3× its baseline) and comes out `major`: one measure, moving upward, nothing
-operational behind it. 2026-08-05 scores lower (8.93) and comes out `critical`,
-because its revenue shortfall arrives with the refund rate up 33 points and
-average order value down 64%. Ranked by score alone, the wrong one is at the top
-of the queue.
+**The live data demonstrates the distinction rather than asserting it.** In any
+given series there are days carrying a higher anomaly score than days graded
+more severely than them — one measure moving sharply, with nothing operational
+behind it and too little money at stake to be worth a person's afternoon. Ranked
+by score alone, the wrong day sits at the top of the queue.
+
+The figures differ every time the order book is regenerated, so no example is
+quoted here. The property is asserted instead, against whatever series the
+warehouse currently holds: `severity does not simply follow the anomaly score`
+in [test_stage6_decisions.py](../n8n/tests/test_stage6_decisions.py) searches
+for a louder day graded less severe than a quieter one, and fails if the two
+orderings have collapsed into each other.
 
 ### Routing is a constraint, not a convention
 

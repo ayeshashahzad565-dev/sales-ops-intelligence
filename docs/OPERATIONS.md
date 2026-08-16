@@ -153,7 +153,7 @@ docker compose exec n8n wget -qO- http://mock-api:8000/health
 - [ ] n8n loads at `localhost:5678` and the setup screen appears
 - [ ] `./metabase/provision.sh` reports 31 cards and 4 dashboards
 - [ ] The reporting role is refused a write (the script checks this and stops if not)
-- [ ] The *Anomaly Investigation* dashboard traces 2026-08-05 in ten steps
+- [ ] The *Anomaly Investigation* dashboard traces the injected incident in ten steps
 - [ ] n8n can reach `http://mock-api:8000/health` from inside the network
 - [ ] `docker compose restart mock-api` preserves the order count
 - [ ] `docker compose down` then `up -d` preserves the n8n account you created
