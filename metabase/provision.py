@@ -257,7 +257,14 @@ class Metabase:
         return self.post("/api/card", body)["id"]
 
     # -- dashboards ---------------------------------------------------------
-    def ensure_dashboard(self, spec, collection_id: int, card_ids: dict) -> int:
+    def ensure_dashboard_shell(self, spec, collection_id: int) -> int:
+        """Create the dashboard if it is missing, and return its id.
+
+        Separate from filling it in because a card can be made to link to
+        another dashboard, and the target's id is only knowable once every
+        dashboard exists. So every shell is created first, then every shell is
+        populated.
+        """
         items = self.get(f"/api/collection/{collection_id}/items?models=dashboard")
         by_name = {i["name"]: i["id"] for i in items.get("data", [])}
 
@@ -269,7 +276,10 @@ class Metabase:
                 "collection_id": collection_id,
             })["id"]
             print(f"  Dashboard '{spec['name']}' created (id {dashboard_id})")
+        return dashboard_id
 
+    def fill_dashboard(self, spec, dashboard_id: int, card_ids: dict,
+                       dashboard_ids: dict) -> None:
         dashcards = []
         next_placeholder = -1
         for entry in spec["cards"]:
@@ -305,6 +315,36 @@ class Metabase:
                         "card_id": card_id,
                         "target": ["variable", ["template-tag", tag]],
                     }]
+
+                # A row that names a date can carry the reader to that date's
+                # investigation. The mapping is by column name because these are
+                # native queries: there is no field id to point at.
+                link = entry.get("link")
+                if link:
+                    target_id = dashboard_ids.get(link["dashboard"])
+                    if target_id is None:
+                        raise SystemExit(
+                            f"{entry['card']} links to unknown dashboard "
+                            f"'{link['dashboard']}'"
+                        )
+                    parameter_id = link["parameter_id"]
+                    common["visualization_settings"] = {
+                        "click_behavior": {
+                            "type": "link",
+                            "linkType": "dashboard",
+                            "targetId": target_id,
+                            "parameterMapping": {
+                                parameter_id: {
+                                    "id": parameter_id,
+                                    "source": {"type": "column",
+                                               "id": link["column"],
+                                               "name": link["column"]},
+                                    "target": {"type": "parameter",
+                                               "id": parameter_id},
+                                },
+                            },
+                        },
+                    }
             dashcards.append(common)
 
         self.put(f"/api/dashboard/{dashboard_id}", {
@@ -318,7 +358,6 @@ class Metabase:
             # for their data, so they get the window.
             "width": spec.get("width", "full"),
         })
-        return dashboard_id
 
 
 # ---------------------------------------------------------------------------
@@ -372,9 +411,16 @@ def main() -> int:
             spec, database_id, collection_id, existing)
     print(f"  {len(card_ids)} card(s) in place")
 
+    # Two passes: every dashboard has to exist before any of them can be told
+    # to link to another.
+    dashboard_ids = {
+        spec["key"]: metabase.ensure_dashboard_shell(spec, collection_id)
+        for spec in DASHBOARDS
+    }
     for spec in DASHBOARDS:
-        dashboard_id = metabase.ensure_dashboard(spec, collection_id, card_ids)
-        print(f"  {spec['name']}: {base_url}/dashboard/{dashboard_id}")
+        metabase.fill_dashboard(spec, dashboard_ids[spec["key"]], card_ids,
+                                dashboard_ids)
+        print(f"  {spec['name']}: {base_url}/dashboard/{dashboard_ids[spec['key']]}")
 
     print("\nDone. The connection Metabase stores is salesops_readonly, which has "
           "SELECT and nothing else.")

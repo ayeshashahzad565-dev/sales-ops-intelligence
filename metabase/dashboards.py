@@ -124,9 +124,16 @@ def _fmt(column, **settings):
     return {json.dumps(["name", column]): settings}
 
 
-def _money(column, decimals=0):
+def _money(column, decimals=0, **extra):
+    """Currency formatting. `extra` merges INTO the same column entry.
+
+    Both helpers key on the column name, so composing them by merging two dicts
+    would silently drop whichever came first - the currency symbol would vanish
+    the moment anyone asked for a mini bar as well.
+    """
     return _fmt(column, number_style="currency", currency="USD",
-                currency_style="symbol", currency_in_header=False, decimals=decimals)
+                currency_style="symbol", currency_in_header=False,
+                decimals=decimals, **extra)
 
 
 def _percent(column, decimals=1):
@@ -359,7 +366,13 @@ CARDS = [
         ),
         settings={
             "table.column_formatting": _severity_colours("Severity"),
-            "column_settings": _money("Absolute revenue delta (USD)"),
+            "column_settings": {
+                **_money("Absolute revenue delta (USD)"),
+                # A count rendered as a bar as well as a number: the shape of the
+                # distribution is the point, and four rows of digits do not have
+                # a shape.
+                **_fmt("Days", show_mini_bar=True),
+            },
         },
     ),
     _card(
@@ -384,7 +397,7 @@ CARDS = [
         ),
         settings={
             "table.column_formatting": _severity_colours("Severity"),
-            "column_settings": _money("Revenue delta (USD)"),
+            "column_settings": _money("Revenue delta (USD)", show_mini_bar=True),
         },
     ),
     _card(
@@ -410,7 +423,7 @@ CARDS = [
         ),
         settings={
             "table.column_formatting": _severity_colours("Severity"),
-            "column_settings": _money("Revenue delta (USD)"),
+            "column_settings": _money("Revenue delta (USD)", show_mini_bar=True),
         },
     ),
     _card(
@@ -903,9 +916,23 @@ def _text(text, row, col, size_x, size_y):
                          "text.align_horizontal": "left"}}
 
 
-def _viz(key, row, col, size_x, size_y):
-    return {"kind": "card", "card": key, "row": row, "col": col,
-            "size_x": size_x, "size_y": size_y}
+def _viz(key, row, col, size_x, size_y, link=None):
+    entry = {"kind": "card", "card": key, "row": row, "col": col,
+             "size_x": size_x, "size_y": size_y}
+    if link:
+        entry["link"] = link
+    return entry
+
+
+#: Clicking a row that names a date opens that date's investigation. This is the
+#: only navigation on the platform, and it runs in the one direction the
+#: architecture allows: from a summary down into the evidence beneath it, never
+#: from a conclusion back up into anything that could change it.
+TO_INVESTIGATION = {
+    "dashboard": "investigation",
+    "parameter_id": INCIDENT_DATE_PARAM_ID,
+    "column": "Date",
+}
 
 
 # ===========================================================================
@@ -951,15 +978,15 @@ DASHBOARDS = [
             _text("## First a statistical signal, then a deterministic decision",
                   24, 0, 24, 1),
             _viz("exec_severity", 25, 0, 24, 5),
-            _viz("exec_timeline", 30, 0, 24, 6),
-            _viz("exec_actionable", 36, 0, 24, 6),
+            _viz("exec_timeline", 30, 0, 24, 6, link=TO_INVESTIGATION),
+            _viz("exec_actionable", 36, 0, 24, 6, link=TO_INVESTIGATION),
 
             _text("## Nothing below this line happened without a person",
                   42, 0, 24, 1),
             # Full width, not half: these carry seven and eight columns each, and
             # a horizontal scrollbar inside a panel is the sign that the panel
             # was sized for the layout rather than for its data.
-            _viz("exec_needs_review", 43, 0, 24, 6),
+            _viz("exec_needs_review", 43, 0, 24, 6, link=TO_INVESTIGATION),
             _viz("exec_reviews", 49, 0, 24, 5),
             _viz("exec_notifications", 54, 0, 12, 5),
             _viz("exec_remediation", 54, 12, 12, 5),
