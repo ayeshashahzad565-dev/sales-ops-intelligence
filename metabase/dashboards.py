@@ -647,23 +647,54 @@ CARDS = [
         "inv_hypothesis",
         "LLM hypothesis - unverified",
         """
-        SELECT llm_model_provider     AS "Provider",
-               llm_model_name         AS "Model",
-               llm_confidence         AS "Confidence the model stated",
-               llm_verified           AS "Verified by this system",
-               llm_summary            AS "Summary",
-               llm_primary_hypothesis AS "Primary hypothesis",
-               llm_missing_evidence   AS "Evidence the model reported it lacked",
-               llm_prompt_version     AS "Prompt version",
-               llm_generated_at       AS "Generated at"
-        FROM salesops.anomaly_investigation
-        WHERE calendar_date = {{incident_date}}
+        WITH h AS (
+            SELECT * FROM salesops.anomaly_investigation
+            WHERE calendar_date = {{incident_date}}
+        )
+        SELECT f.rank AS "#", f.name AS "Field", f.value AS "Value"
+        FROM h
+        CROSS JOIN LATERAL (VALUES
+            (1, 'Verified by this system', h.llm_verified::text),
+            (2, 'Confidence the model stated', h.llm_confidence),
+            (3, 'Summary', h.llm_summary),
+            (4, 'Primary hypothesis', h.llm_primary_hypothesis),
+            (5, 'Alternative hypotheses',
+                (SELECT string_agg(i ->> 'hypothesis', '  //  ')
+                 FROM jsonb_array_elements(h.llm_alternative_hypotheses) AS i)),
+            (6, 'Evidence it cited',
+                (SELECT string_agg(i ->> 'observation', '  //  ')
+                 FROM jsonb_array_elements(h.llm_supporting_evidence) AS i)),
+            (7, 'Checks it recommends',
+                (SELECT string_agg(i, '  //  ')
+                 FROM jsonb_array_elements_text(h.llm_recommended_checks) AS i)),
+            (8, 'Evidence it reported it lacked',
+                (SELECT string_agg(i, '  //  ')
+                 FROM jsonb_array_elements_text(h.llm_missing_evidence) AS i)),
+            (9, 'Provider', h.llm_model_provider),
+            (10, 'Model', h.llm_model_name),
+            (11, 'Prompt version', h.llm_prompt_version),
+            (12, 'Generated at', h.llm_generated_at::text)
+        ) AS f(rank, name, value)
+        ORDER BY f.rank
         """,
         description=(
             "Generated after the decision and incapable of changing it. 'Verified "
             "by this system' is false on every row that exists, because nothing "
             "here verifies a hypothesis."
         ),
+        settings={
+            # One record, read down rather than across. As nine columns this was
+            # a single row whose prose ran off the right edge behind a scrollbar,
+            # under headings the reader could never see - a poor way to present
+            # the one panel on the platform that has to be read sceptically.
+            #
+            # Verification status is the first line, the model's prose follows
+            # it, and provenance closes. The JSON arrays are unpacked to the one
+            # field in each that carries the claim; rendering them raw would put
+            # braces and quote marks in front of a reader who wants a sentence.
+            "table.column_formatting": [_paint("Value", "false", CRITICAL)],
+            "column_settings": _fmt("Value", text_wrapping=True),
+        },
         tags=_INCIDENT_DATE_TAG,
     ),
     _card(
@@ -1095,10 +1126,10 @@ DASHBOARDS = [
                 "stored evidence, and incapable of changing it. Treat it as a lead to "
                 "check, never as a finding.",
                 27, 0, 24, 3),
-            _viz("inv_hypothesis", 30, 0, 24, 7),
-            _text("## Audit history", 37, 0, 24, 1),
-            _viz("inv_audit", 38, 0, 24, 7),
-            _viz("inv_picker", 45, 0, 24, 6),
+            _viz("inv_hypothesis", 30, 0, 24, 12),
+            _text("## Audit history", 42, 0, 24, 1),
+            _viz("inv_audit", 43, 0, 24, 7),
+            _viz("inv_picker", 50, 0, 24, 6),
         ],
     },
     {
