@@ -11,8 +11,15 @@
 # altered in transit.
 #
 # Usage:
-#   ./database/migrate.sh          apply migrations
-#   ./database/migrate.sh --test   apply migrations, then validate the schema
+#   ./database/migrate.sh              apply migrations
+#   ./database/migrate.sh --test       apply migrations, then validate the schema
+#   ./database/migrate.sh --test-only  validate the schema, applying nothing
+#
+# --test-only exists because re-applying idempotent migrations to a database
+# that already has them prints a "already exists, skipping" notice per object,
+# which buries the validation result under output that reads like failure. The
+# suite tests the schema as it stands; it does not need the migrations replayed
+# first to do that.
 
 set -euo pipefail
 
@@ -28,7 +35,15 @@ repo_root="$(dirname "$script_dir")"
 cd "$repo_root"
 
 run_test=false
-[[ "${1:-}" == "--test" ]] && run_test=true
+apply_migrations=true
+case "${1:-}" in
+    --test)      run_test=true ;;
+    --test-only) run_test=true; apply_migrations=false ;;
+    "")          ;;
+    *)           echo "Unknown option: $1" >&2
+                 echo "Usage: ${0##*/} [--test | --test-only]" >&2
+                 exit 2 ;;
+esac
 
 psql_file() {
     # Git Bash on Windows rewrites arguments that look like Unix paths into host
@@ -39,28 +54,30 @@ psql_file() {
         psql -U "$USER_NAME" -d "$DATABASE" -v ON_ERROR_STOP=1 --quiet -f "$1"
 }
 
-shopt -s nullglob
-migrations=("$script_dir"/migrations/V*.sql)
-shopt -u nullglob
+if [[ "$apply_migrations" == true ]]; then
+    shopt -s nullglob
+    migrations=("$script_dir"/migrations/V*.sql)
+    shopt -u nullglob
 
-if [[ ${#migrations[@]} -eq 0 ]]; then
-    echo "No migrations found in $script_dir/migrations" >&2
-    exit 1
+    if [[ ${#migrations[@]} -eq 0 ]]; then
+        echo "No migrations found in $script_dir/migrations" >&2
+        exit 1
+    fi
+
+    echo "Applying ${#migrations[@]} migration(s) to '$DATABASE'..."
+
+    for migration in "${migrations[@]}"; do
+        name="$(basename "$migration")"
+        echo "  -> $name"
+        psql_file "/database/migrations/$name"
+    done
+
+    echo "Migrations applied."
+
+    docker compose exec -T postgres \
+        psql -U "$USER_NAME" -d "$DATABASE" --quiet \
+        -c "SELECT version, description, applied_at FROM salesops.schema_migrations ORDER BY version;"
 fi
-
-echo "Applying ${#migrations[@]} migration(s) to '$DATABASE'..."
-
-for migration in "${migrations[@]}"; do
-    name="$(basename "$migration")"
-    echo "  -> $name"
-    psql_file "/database/migrations/$name"
-done
-
-echo "Migrations applied."
-
-docker compose exec -T postgres \
-    psql -U "$USER_NAME" -d "$DATABASE" --quiet \
-    -c "SELECT version, description, applied_at FROM salesops.schema_migrations ORDER BY version;"
 
 if [[ "$run_test" == true ]]; then
     echo
