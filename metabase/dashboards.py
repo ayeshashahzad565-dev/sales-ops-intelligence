@@ -654,7 +654,15 @@ CARDS = [
         SELECT f.rank AS "#", f.name AS "Field", f.value AS "Value"
         FROM h
         CROSS JOIN LATERAL (VALUES
-            (1, 'Verified by this system', h.llm_verified::text),
+            -- llm_verified is a plain boolean and defaults to false, so on a date
+            -- Stage 7 never reached it rendered 'false' beside eleven empty rows.
+            -- That reads as "we hold an unverified hypothesis" when the truth is
+            -- "we hold none", which is a different and much weaker claim. Say
+            -- which one it is.
+            (1, 'Verified by this system',
+             CASE WHEN h.llm_generated_at IS NULL
+                  THEN 'no hypothesis was generated for this date'
+                  ELSE h.llm_verified::text END),
             (2, 'Confidence the model stated', h.llm_confidence),
             (3, 'Summary', h.llm_summary),
             (4, 'Primary hypothesis', h.llm_primary_hypothesis),
@@ -692,7 +700,11 @@ CARDS = [
             # it, and provenance closes. The JSON arrays are unpacked to the one
             # field in each that carries the claim; rendering them raw would put
             # braces and quote marks in front of a reader who wants a sentence.
-            "table.column_formatting": [_paint("Value", "false", CRITICAL)],
+            "table.column_formatting": [
+                _paint("Value", "false", CRITICAL),
+                # Absence is not a finding. Colour it as a gap, not as a verdict.
+                _paint("Value", "no hypothesis was generated for this date", NEUTRAL),
+            ],
             "column_settings": _fmt("Value", text_wrapping=True),
         },
         tags=_INCIDENT_DATE_TAG,
