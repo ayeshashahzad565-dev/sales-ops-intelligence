@@ -92,8 +92,11 @@ _PROVIDER_BASE_URLS = {
 
 #: A sensible default per provider, so a first run needs only a key. Model
 #: line-ups move quickly; treat these as a starting point, not a guarantee.
+#: Groq retired llama-3.3-70b-versatile, which then answered every Stage 7 call
+#: with HTTP 404 rather than anything resembling a model problem. Set LLM_MODEL
+#: explicitly if a default here has since gone the same way.
 _PROVIDER_DEFAULT_MODELS = {
-    "groq": "llama-3.3-70b-versatile",
+    "groq": "openai/gpt-oss-120b",
     "openai": "gpt-4.1-mini",
 }
 

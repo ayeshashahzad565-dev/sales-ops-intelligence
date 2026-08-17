@@ -378,11 +378,14 @@ model and by the week. That fallback is capability negotiation at the transport
 layer, **not** repairing bad output: the response is validated identically either
 way, and which mode was actually used is persisted in `json_mode`.
 
-The live default exercises the fallback. Groq's `llama-3.3-70b-versatile` returns
-`This model does not support response format json_schema`, so every stored
-hypothesis carries `json_mode = object` — valid JSON guaranteed by the provider,
-shape guaranteed by us. That is why the prompt states the output contract in full
-rather than relying on the transport; see below.
+Which path runs depends entirely on the model in front of it, and that changes.
+The previous default here, Groq's `llama-3.3-70b-versatile`, rejected
+`json_schema` outright, so every stored hypothesis carried `json_mode = object`.
+That model has since been retired, and the current default accepts `json_schema`
+and occasionally produces output the provider then refuses as non-conforming, a
+failure the caller retries. Both paths are exercised in practice, which is the
+argument for the prompt stating the output contract in full rather than relying
+on the transport; see below.
 
 ## Evidence
 
